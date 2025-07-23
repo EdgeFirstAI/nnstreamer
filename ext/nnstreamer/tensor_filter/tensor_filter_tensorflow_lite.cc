@@ -244,6 +244,7 @@ class TFLiteInterpreter
   char *model_path;
   bool is_cached_after_first_invoke; /**< To cache again after first invoke */
   bool is_xnnpack_delegated; /**< To check if XNNPACK delegate is used */
+  bool is_ethosu_delegated;
   char *ext_delegate_path; /**< path to external delegate lib */
   GHashTable *ext_delegate_kv_table; /**< external delegate key values options */
   QNNBackendType qnn_backend_type; /**< QNN Delegate backend type */
@@ -332,6 +333,7 @@ TFLiteInterpreter::TFLiteInterpreter ()
 
   is_cached_after_first_invoke = false;
   is_xnnpack_delegated = false;
+  is_ethosu_delegated = false;
 }
 
 /**
@@ -366,7 +368,7 @@ TFLiteInterpreter::invoke (const GstTensorMemory *input, GstTensorMemory *output
    * Therefore tensor data is to be manually copied from/to input/output
    * GStreamer buffers memory whose address changes at every round.
    */
-  if (is_xnnpack_delegated) {
+  if (is_xnnpack_delegated || is_ethosu_delegated) {
     for (unsigned int i = 0; i < inputTensorMeta.num_tensors; ++i) {
       tensor_ptr = inputTensorPtr[i];
       g_assert (tensor_ptr->bytes == input[i].size);
@@ -395,7 +397,7 @@ TFLiteInterpreter::invoke (const GstTensorMemory *input, GstTensorMemory *output
    * After the very first invoke, the output buffer address may change.
    * To handle the case, memcpy the output buffer directly.
    */
-  if (is_xnnpack_delegated || !is_cached_after_first_invoke) {
+  if (is_xnnpack_delegated || is_ethosu_delegated || !is_cached_after_first_invoke) {
     for (unsigned int i = 0; i < outputTensorMeta.num_tensors; ++i) {
       tensor_ptr = outputTensorPtr[i];
       g_assert (tensor_ptr->bytes == output[i].size);
@@ -555,6 +557,9 @@ TFLiteInterpreter::loadModel (int num_threads, tflite_delegate_e delegate_e)
 
         options = TfLiteExternalDelegateOptionsDefault (ext_delegate_path);
 
+        if (strcmp(ext_delegate_path, "libethosu_delegate.so") == 0){
+          is_ethosu_delegated = true;
+	}
         /* Add optional key values to delegate configuration */
         if (ext_delegate_kv_table) {
           GHashTable *table = ext_delegate_kv_table;
