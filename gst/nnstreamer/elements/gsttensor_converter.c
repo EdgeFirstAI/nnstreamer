@@ -1100,9 +1100,15 @@ gst_tensor_converter_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
          */
         size = offset = type * color * width;
 
-        g_assert (offset % 4); /** Internal logic error! */
-        if (offset % 4) {
-          offset += 4 - (offset % 4);
+        /* Calculate the offset by video meta if is exist */
+        GstVideoMeta *video_meta = gst_buffer_get_video_meta (buf);
+        if (video_meta) {
+           offset = video_meta->stride[0];
+        } else {
+          g_assert (offset % 4); /** Internal logic error! */
+          if (offset % 4) {
+            offset += 4 - (offset % 4);
+          }
         }
 
         for (d0 = 0; d0 < frames_in; d0++) {
