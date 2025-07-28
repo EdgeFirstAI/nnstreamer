@@ -1076,6 +1076,7 @@ gst_tensor_converter_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
 
       if (self->remove_padding || self->remove_imx_padding) {
         GstMapInfo src_info, dest_info;
+        GstVideoMeta *video_meta;
         guint d0, d1;
         unsigned int src_idx = 0, dest_idx = 0;
         size_t size, offset;
@@ -1102,7 +1103,7 @@ gst_tensor_converter_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
         size = offset = type * color * width;
 
         /* Calculate the offset by video meta if is exist */
-        GstVideoMeta *video_meta = gst_buffer_get_video_meta (buf);
+        video_meta = gst_buffer_get_video_meta (buf);
         if (video_meta) {
            offset = video_meta->stride[0];
         } else if (self->remove_imx_padding && !self->remove_padding) {
