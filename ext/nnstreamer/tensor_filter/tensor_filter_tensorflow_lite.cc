@@ -99,13 +99,6 @@
 #endif
 
 /**
- * @brief prevent usage by TFLite of default delegates that may not be supported
- */
-#if TFLITE_VERSION_MAJOR >= 2 && TFLITE_VERSION_MINOR >= 4
-#define TFLITE_RESOLVER_WITHOUT_DEFAULT_DELEGATES
-#endif
-
-/**
  * @brief Macro for debug mode.
  */
 #ifndef DBG
@@ -157,6 +150,7 @@ typedef struct {
   GHashTable *ext_delegate_kv_table; /**< external delegate key values options */
   QNNBackendType qnn_backend_type; /**< QNN Delegate backend type */
   QNNPerformanceMode qnn_performance_mode; /**< QNN Delegate performance mode */
+  bool use_default_delegates; /**< whether to use default delegates in resolver */
 } tflite_option_s;
 
 /**
@@ -197,6 +191,10 @@ class TFLiteInterpreter
   void setModelPath (const char *model_path);
   void setExtDelegate (const char *lib_path, GHashTable *key_val);
   void getExtDelegate (const char **lib_path, GHashTable **key_val);
+  void setUseDefaultDelegates (gboolean use_default)
+  {
+    use_default_delegates = use_default;
+  }
   /** @brief get current model path */
   const char *getModelPath ()
   {
@@ -249,6 +247,7 @@ class TFLiteInterpreter
   GHashTable *ext_delegate_kv_table; /**< external delegate key values options */
   QNNBackendType qnn_backend_type; /**< QNN Delegate backend type */
   QNNPerformanceMode qnn_performance_mode; /**< QNN Delegate performance mode */
+  bool use_default_delegates; /**< whether to use default delegates in resolver */
 
   std::unique_ptr<tflite::Interpreter> interpreter;
   std::unique_ptr<tflite::FlatBufferModel> model;
@@ -325,6 +324,7 @@ TFLiteInterpreter::TFLiteInterpreter ()
   ext_delegate_kv_table = nullptr;
   qnn_backend_type = QNN_BACKEND_UNDEFINED;
   qnn_performance_mode = QNN_PERFMODE_Default;
+  use_default_delegates = FALSE;
 
   g_mutex_init (&mutex);
 
@@ -462,12 +462,14 @@ TFLiteInterpreter::loadModel (int num_threads, tflite_delegate_e delegate_e)
 
   interpreter = nullptr;
 
-#ifdef TFLITE_RESOLVER_WITHOUT_DEFAULT_DELEGATES
-  tflite::ops::builtin::BuiltinOpResolverWithoutDefaultDelegates resolver;
-#else
-  tflite::ops::builtin::BuiltinOpResolver resolver;
-#endif
-  tflite::InterpreterBuilder (*model, resolver) (&interpreter);
+  if (use_default_delegates) {
+    tflite::ops::builtin::BuiltinOpResolver resolver;
+    tflite::InterpreterBuilder (*model, resolver) (&interpreter);
+  } else {
+    tflite::ops::builtin::BuiltinOpResolverWithoutDefaultDelegates resolver;
+    tflite::InterpreterBuilder (*model, resolver) (&interpreter);
+  }
+
   if (!interpreter) {
     ml_loge ("Failed to construct interpreter\n");
     return -2;
@@ -1080,6 +1082,7 @@ TFLiteCore::init (tflite_option_s *option)
 {
   interpreter->setModelPath (option->model_file);
   interpreter->setExtDelegate (option->ext_delegate_path, option->ext_delegate_kv_table);
+  interpreter->setUseDefaultDelegates (option->use_default_delegates);
   interpreter->qnn_backend_type = option->qnn_backend_type;
   interpreter->qnn_performance_mode = option->qnn_performance_mode;
   num_threads = option->num_threads;
@@ -1400,6 +1403,13 @@ tflite_parseCustomOption (const GstTensorFilterProperties *prop, tflite_option_s
 
         if (g_ascii_strcasecmp (pair[0], "NumThreads") == 0) {
           option->num_threads = (int) g_ascii_strtoll (pair[1], NULL, 10);
+        } else if (g_ascii_strcasecmp (pair[0], "UseDefaultDelegates") == 0) {
+          if (g_ascii_strcasecmp (pair[1], "true") == 0 || g_ascii_strcasecmp (pair[1], "1") == 0)
+            option->use_default_delegates = TRUE;
+          else if (g_ascii_strcasecmp (pair[1], "false") == 0 || g_ascii_strcasecmp (pair[1], "0") == 0)
+            option->use_default_delegates = FALSE;
+          else
+            ml_logw ("Invalid value for UseDefaultDelegates (%s). Use 'true' or 'false'.", pair[1]);
         } else if (g_ascii_strcasecmp (pair[0], "Delegate") == 0) {
           if (g_ascii_strcasecmp (pair[1], "NNAPI") == 0)
             option->delegate = TFLITE_DELEGATE_NNAPI;
@@ -1782,8 +1792,9 @@ _nns_filter_register_tflite (void)
 {
   nnstreamer_filter_probe (&NNS_support_tensorflow_lite);
   nnstreamer_filter_set_custom_property_desc (NNS_support_tensorflow_lite.v0.name,
-      "NumThreads", "Number of threads. Set 0 for default behaviors.", "Delegate",
-      "TF-Lite delegation options: {'NNAPI', 'GPU', 'XNNPACK', 'External', 'QNN'}."
+      "NumThreads", "Number of threads. Set 0 for default behaviors.",
+      "UseDefaultDelegates", "Whether to use default delegates in resolver. Set 'true' or 'false'. Default is 'false'.",
+      "Delegate", "TF-Lite delegation options: {'NNAPI', 'GPU', 'XNNPACK', 'External', 'QNN'}."
       " Do not specify to disable delegation.",
       "ExtDelegateLib", "Path to external delegate shared library", "ExtDelegateKeyVal",
       "key/values pairs optional parameters for delegate."
