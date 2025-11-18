@@ -92,6 +92,7 @@ struct _GstTensorConverter
 
   gsize frame_size; /**< size of one frame */
   gboolean remove_padding; /**< If true, zero-padding must be removed */
+  gboolean remove_imx_padding; /**< If true, i.MX-specific zero-padding must be removed */
   gboolean tensors_configured; /**< True if already successfully configured tensors metadata */
   GstTensorsConfig tensors_config; /**< output tensors info */
 

@@ -359,6 +359,7 @@ gst_tensor_converter_init (GstTensorConverter * self)
   self->in_media_type = _NNS_MEDIA_INVALID;
   self->frame_size = 0;
   self->remove_padding = FALSE;
+  self->remove_imx_padding = FALSE;
   self->externalConverter = NULL;
   self->priv_data = NULL;
   self->mode = _CONVERTER_MODE_NONE;
@@ -1032,7 +1033,7 @@ gst_tensor_converter_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
   GstTensorsConfig new_config;
   GstTensorInfo *_info;
   GstBuffer *inbuf;
-  gsize buf_size, frame_size;
+  gsize buf_size, frame_size, frame_padding;
   guint frames_in, frames_out;
   UNUSED (pad);
 
@@ -1073,7 +1074,7 @@ gst_tensor_converter_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
       /** supposed 1 frame in buffer */
       g_assert ((buf_size / self->frame_size) == 1);
 
-      if (self->remove_padding) {
+      if (self->remove_padding || self->remove_imx_padding) {
         GstMapInfo src_info, dest_info;
         guint d0, d1;
         unsigned int src_idx = 0, dest_idx = 0;
@@ -1104,6 +1105,13 @@ gst_tensor_converter_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
         GstVideoMeta *video_meta = gst_buffer_get_video_meta (buf);
         if (video_meta) {
            offset = video_meta->stride[0];
+        } else if (self->remove_imx_padding && !self->remove_padding) {
+          /**
+           * If GstVideoMeta is missing, the buffer comes from a generic GStreamer plugin.
+           * Only the default 4-bytes alignment correction should be done, the i.MX specific
+           * one should be skipped.
+           */
+          break;
         } else {
           g_assert (offset % 4); /** Internal logic error! */
           if (offset % 4) {
@@ -1111,11 +1119,21 @@ gst_tensor_converter_chain (GstPad * pad, GstObject * parent, GstBuffer * buf)
           }
         }
 
+        /* Calculate frame padding (padding at the end of entire frame) */
+        frame_padding = 0;
+        if (buf_size > frame_size) {
+           frame_padding = buf_size - frame_size;
+        }
+
         for (d0 = 0; d0 < frames_in; d0++) {
           for (d1 = 0; d1 < height; d1++) {
             memcpy (dest_info.data + dest_idx, src_info.data + src_idx, size);
             dest_idx += size;
             src_idx += offset;
+          }
+          /* Skip frame padding if it exists (after all rows of current frame) */
+          if (frame_padding > 0 && d0 < (frames_in - 1)) {
+            src_idx += frame_padding;
           }
         }
 
@@ -1439,6 +1457,26 @@ gst_tensor_converter_video_stride (GstVideoFormat format, gint width)
 }
 
 /**
+ * @brief Determine if we need i.MX-specific zero-padding
+ * @return TRUE if we need to add (or remove) stride per row from the stream data.
+ */
+static gboolean
+gst_tensor_converter_video_stride_imx (GstVideoFormat format, gint width, gint height, gsize frame_size)
+{
+  switch (format) {
+    case GST_VIDEO_FORMAT_GRAY8:
+      if ((width % 16) || (height % 16) || (frame_size % 4096)) {
+        return TRUE;
+      }
+      break;
+    default:
+      break;
+  }
+
+  return FALSE;
+}
+
+/**
  * @brief Set the tensors config structure from video info (internal static function)
  * @param self this pointer to GstTensorConverter
  * @param caps caps for media stream
@@ -1459,6 +1497,7 @@ gst_tensor_converter_parse_video (GstTensorConverter * self,
   GstVideoFormat format;
   gint width, height, views;
   guint i;
+  gsize size = 0;  // Frame size
 
   g_return_val_if_fail (config != NULL, FALSE);
 
@@ -1494,6 +1533,7 @@ gst_tensor_converter_parse_video (GstTensorConverter * self,
       config->info.info[0].dimension[0] = 1;
       config->info.info[0].dimension[1] = width;
       config->info.info[0].dimension[2] = height;
+      size = 1 * width * height;  // 1 byte per pixel
       break;
     case GST_VIDEO_FORMAT_GRAY16_BE:
     case GST_VIDEO_FORMAT_GRAY16_LE:
@@ -1501,6 +1541,7 @@ gst_tensor_converter_parse_video (GstTensorConverter * self,
       config->info.info[0].dimension[0] = 1;
       config->info.info[0].dimension[1] = width;
       config->info.info[0].dimension[2] = height;
+      size = 2 * 1 * width * height;  // 2 bytes per pixel
       break;
     case GST_VIDEO_FORMAT_RGB:
     case GST_VIDEO_FORMAT_BGR:
@@ -1508,6 +1549,7 @@ gst_tensor_converter_parse_video (GstTensorConverter * self,
       config->info.info[0].dimension[0] = 3;
       config->info.info[0].dimension[1] = width;
       config->info.info[0].dimension[2] = height;
+      size = 1 * 3 * width * height;  // 1 byte per channel, 3 channels
       break;
     case GST_VIDEO_FORMAT_RGBx:
     case GST_VIDEO_FORMAT_BGRx:
@@ -1521,6 +1563,7 @@ gst_tensor_converter_parse_video (GstTensorConverter * self,
       config->info.info[0].dimension[0] = 4;
       config->info.info[0].dimension[1] = width;
       config->info.info[0].dimension[2] = height;
+      size = 1 * 4 * width * height;  // 1 byte per channel, 4 channels
       break;
 #if GST_CHECK_VERSION(1, 20, 0)
     case GST_VIDEO_FORMAT_RGBP:
@@ -1570,6 +1613,9 @@ gst_tensor_converter_parse_video (GstTensorConverter * self,
         "\nYOUR STREAM CONFIGURATION INCURS PERFORMANCE DETERIORATION!\n"
         "Please use 4 x n as image width for inputs; the width of your input is %d.\n",
         width);
+  }
+  if (gst_tensor_converter_video_stride_imx (format, width, height, size)) {
+    self->remove_imx_padding = TRUE;
   }
 
   self->frame_size = GST_VIDEO_INFO_SIZE (&vinfo);
