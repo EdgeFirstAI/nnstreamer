@@ -918,3 +918,23 @@ if llama2c_support_is_available
     install_dir: nnstreamer_libdir
   )
 endif
+
+# Ara-2 NPU sub-plugin — uses dvapi.h for struct defs, dlopen at runtime
+ara2_support = get_option('ara2-support')
+if ara2_support.disabled()
+  ara2_available = false
+else
+  ara2_available = cc.has_header('dvapi.h')
+  if not ara2_available and ara2_support.enabled()
+    error('ara2-support=enabled but dvapi.h not found')
+  endif
+endif
+
+if ara2_available
+  shared_library('nnstreamer_filter_ara2',
+    'tensor_filter_ara2.cc',
+    dependencies: [glib_dep, gst_allocators_dep, libdl_dep, nnstreamer_single_dep],
+    install: true,
+    install_dir: filter_subplugin_install_dir
+  )
+endif

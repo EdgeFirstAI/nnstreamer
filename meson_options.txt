@@ -35,6 +35,7 @@ option('ml-agent-support', type: 'feature', value: 'auto')
 option('onnxruntime-support', type: 'feature', value: 'auto')
 option('dali-support', type: 'feature', value: 'auto')
 option('llama2c-support', type: 'feature', value: 'auto')
+option('ara2-support', type: 'feature', value: 'auto', description: 'Build Kinara Ara-2 NPU tensor filter sub-plugin (requires dvapi.h)')
 
 # booleans & other options
 option('enable-test', type: 'boolean', value: true)
