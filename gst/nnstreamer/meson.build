@@ -23,6 +23,7 @@ nnstreamer_deps = [
   gst_controller_dep,
   gst_video_dep,
   gst_audio_dep,
+  gst_allocators_dep,
   thread_dep,
   gio_dep
 ]

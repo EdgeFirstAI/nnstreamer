@@ -484,7 +484,7 @@ verify_model_path (const GstTensorFilterPrivate * priv)
   if (g_strcmp0 (prop->fwname, "custom-easy") == 0)
     return TRUE;
 
-  if (GST_TF_FW_V0 (priv->fw)) {
+  if (GST_TF_FW_V0 (priv->fw) || GST_TF_FW_V2 (priv->fw)) {
     verify_model_path = priv->fw->verify_model_path;
   } else if (GST_TF_FW_V1 (priv->fw)) {
     verify_model_path = priv->info.verify_model_path;
@@ -575,6 +575,22 @@ nnstreamer_filter_validate (const GstTensorFilterFramework * tfsp)
       /* no method to get tensor info */
       return FALSE;
     }
+  } else if (GST_TF_FW_V2 (tfsp)) {
+    if (!tfsp->v2.invoke_v2) {
+      /* no invoke function */
+      return FALSE;
+    }
+
+    if (!tfsp->name) {
+      /* invalid fw name */
+      return FALSE;
+    }
+
+    if (!(tfsp->getInputDimension && tfsp->getOutputDimension) &&
+        !tfsp->setInputDimension) {
+      /* no method to get tensor info */
+      return FALSE;
+    }
   } else if (GST_TF_FW_V1 (tfsp)) {
     GstTensorFilterFrameworkInfo info;
     GstTensorFilterProperties prop;
@@ -616,7 +632,7 @@ nnstreamer_filter_probe (GstTensorFilterFramework * tfsp)
 
   g_return_val_if_fail (nnstreamer_filter_validate (tfsp), FALSE);
 
-  if (GST_TF_FW_V0 (tfsp)) {
+  if (GST_TF_FW_V0 (tfsp) || GST_TF_FW_V2 (tfsp)) {
     name = tfsp->name;
   } else if (GST_TF_FW_V1 (tfsp)) {
     gst_tensor_filter_properties_init (&prop);
@@ -772,6 +788,15 @@ gst_tensor_filter_allocate_in_invoke (GstTensorFilterPrivate * priv)
     }
   } else if (GST_TF_FW_V1 (priv->fw)) {
     allocate_in_invoke = priv->info.allocate_in_invoke;
+  } else if (GST_TF_FW_V2 (priv->fw)) {
+    allocate_in_invoke = priv->fw->allocate_in_invoke;
+    if (allocate_in_invoke == TRUE && priv->fw->allocateInInvoke) {
+      if (priv->fw->allocateInInvoke (&priv->privateData) == 0) {
+        allocate_in_invoke = TRUE;
+      } else {
+        allocate_in_invoke = FALSE;
+      }
+    }
   }
 
   return allocate_in_invoke;
@@ -788,7 +813,8 @@ gst_tensor_filter_destroy_notify_util (GstTensorFilterPrivate * priv,
 {
   GstTensorFilterFrameworkEventData event_data;
 
-  if (GST_TF_FW_V0 (priv->fw) && priv->fw->destroyNotify) {
+  if ((GST_TF_FW_V0 (priv->fw) || GST_TF_FW_V2 (priv->fw))
+      && priv->fw->destroyNotify) {
     priv->fw->destroyNotify (&priv->privateData, data);
   } else if (GST_TF_FW_V1 (priv->fw)) {
     event_data.data = data;
@@ -1448,7 +1474,7 @@ _gtfc_setprop_MODEL (GstTensorFilterPrivate * priv,
    * has responsibility for the verification of the path regardless of priv->fw->verify_model_path.
    */
   if (prop->fw_opened) {
-    if (GST_TF_FW_V0 (priv->fw) && priv->is_updatable) {
+    if ((GST_TF_FW_V0 (priv->fw) || GST_TF_FW_V2 (priv->fw)) && priv->is_updatable) {
       if (priv->fw->reloadModel &&
           priv->fw->reloadModel (prop, &priv->privateData) != 0) {
         status = -1;
@@ -1624,7 +1650,7 @@ _gtfc_setprop_CUSTOM (GstTensorFilterPrivate * priv,
     g_free_const (prop->custom_properties);
     prop->custom_properties = g_value_dup_string (value);
   } else {
-    if (GST_TF_FW_V0 (priv->fw)) {
+    if (GST_TF_FW_V0 (priv->fw) || GST_TF_FW_V2 (priv->fw)) {
       ml_loge
           ("Cannot change custom-prop once the element/pipeline is configured.");
     } else if (GST_TF_FW_V1 (priv->fw)) {
@@ -1654,7 +1680,7 @@ _gtfc_setprop_ACCELERATOR (GstTensorFilterPrivate * priv,
   const gchar *accelerators = g_value_get_string (value);
 
   if (priv->prop.fw_opened == TRUE) {
-    if (GST_TF_FW_V0 (priv->fw)) {
+    if (GST_TF_FW_V0 (priv->fw) || GST_TF_FW_V2 (priv->fw)) {
       ml_loge
           ("Cannot change accelerator once the element/pipeline is configured.");
     } else if (GST_TF_FW_V1 (priv->fw)) {
@@ -1684,7 +1710,7 @@ _gtfc_setprop_ACCELERATOR (GstTensorFilterPrivate * priv,
   }
 
   if (priv->fw) {
-    if (GST_TF_FW_V0 (priv->fw)) {
+    if (GST_TF_FW_V0 (priv->fw) || GST_TF_FW_V2 (priv->fw)) {
       g_free_const (prop->accl_str);
       prop->accl_str = g_strdup (accelerators);
     } else if (GST_TF_FW_V1 (priv->fw)) {
@@ -1703,7 +1729,7 @@ _gtfc_setprop_IS_UPDATABLE (GstTensorFilterPrivate * priv,
     GstTensorFilterProperties * prop, const GValue * value)
 {
   if (priv->fw) {
-    if (GST_TF_FW_V0 (priv->fw) && priv->fw->reloadModel == NULL) {
+    if ((GST_TF_FW_V0 (priv->fw) || GST_TF_FW_V2 (priv->fw)) && priv->fw->reloadModel == NULL) {
       priv->is_updatable = FALSE;
       return 0;
     } else if (GST_TF_FW_V1 (priv->fw) &&
@@ -1758,7 +1784,7 @@ _gtfc_setprop_LAYOUT (GstTensorFilterPrivate * priv,
     }
   } else if (value) {
     /** Update the properties */
-    if (GST_TF_FW_V0 (priv->fw)) {
+    if (GST_TF_FW_V0 (priv->fw) || GST_TF_FW_V2 (priv->fw)) {
       /* Once configured, it cannot be changed in runtime */
       ml_loge ("Cannot change layout once the element/pipeline is configured.");
     } else if (GST_TF_FW_V1 (priv->fw)) {
@@ -2164,7 +2190,8 @@ gst_tensor_filter_common_get_property (GstTensorFilterPrivate * priv,
       gint idx;
       GString *accl;
 
-      if (priv->fw == NULL || GST_TF_FW_V0 (priv->fw)) {
+      if (priv->fw == NULL || GST_TF_FW_V0 (priv->fw)
+          || GST_TF_FW_V2 (priv->fw)) {
         if (prop->accl_str != NULL) {
           g_value_set_string (value, prop->accl_str);
         } else {
@@ -2361,7 +2388,7 @@ gst_tensor_filter_common_get_out_info (GstTensorFilterPrivate * priv,
   }
 
   /* call setInputDimension with given input tensor */
-  if (GST_TF_FW_V0 (priv->fw)) {
+  if (GST_TF_FW_V0 (priv->fw) || GST_TF_FW_V2 (priv->fw)) {
     gst_tensor_filter_v0_call (priv, r, setInputDimension, in, out);
   } else {
     gst_tensor_filter_v1_call (priv, r, getModelInfo, SET_INPUT_INFO, in, out);
@@ -2398,6 +2425,7 @@ gst_tensor_filter_load_tensor_info (GstTensorFilterPrivate * priv)
       res_out = res_in;
     }
   } else {
+    /* V0 and V2 share the same callback layout (union memory overlap) */
     if (!prop->input_configured)
       gst_tensor_filter_v0_call (priv, res_in, getInputDimension, &in_info);
     if (!prop->output_configured)
@@ -2471,7 +2499,7 @@ gst_tensor_filter_common_open_fw (GstTensorFilterPrivate * priv)
     start_time = g_get_monotonic_time ();
     if (priv->fw->open) {
       /* at least one model should be configured before opening fw */
-      if (GST_TF_FW_V0 (priv->fw)) {
+      if (GST_TF_FW_V0 (priv->fw) || GST_TF_FW_V2 (priv->fw)) {
         run_without_model = priv->fw->run_without_model;
       } else if (GST_TF_FW_V1 (priv->fw)) {
         run_without_model = priv->info.run_without_model;
@@ -2907,7 +2935,7 @@ gst_tensor_filter_check_hw_availability (const gchar * name, const accl_hw hw,
   /** Only check for specific HW, DEFAULT/AUTO are always supported */
   if (hw == ACCL_AUTO || hw == ACCL_DEFAULT) {
     available = TRUE;
-  } else if (GST_TF_FW_V0 (fw)) {
+  } else if (GST_TF_FW_V0 (fw) || GST_TF_FW_V2 (fw)) {
     if (fw->checkAvailability && fw->checkAvailability (hw) == 0)
       available = TRUE;
   } else if (GST_TF_FW_V1 (fw)) {
@@ -2930,7 +2958,7 @@ gst_tensor_filter_check_hw_availability (const gchar * name, const accl_hw hw,
     edata.hw = hw;
     edata.custom = custom;
 
-    if (GST_TF_FW_V0 (fw)) {
+    if (GST_TF_FW_V0 (fw) || GST_TF_FW_V2 (fw)) {
       if (fw->handleEvent)
         ret = fw->handleEvent (evt, &edata);
     } else if (GST_TF_FW_V1 (fw)) {

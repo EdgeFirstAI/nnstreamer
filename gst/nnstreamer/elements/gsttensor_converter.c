@@ -693,6 +693,26 @@ gst_tensor_converter_sink_query (GstPad * pad, GstObject * parent,
       gst_query_set_accept_caps_result (query, res);
       return TRUE;
     }
+    case GST_QUERY_ALLOCATION:
+    {
+      /* Forward allocation query to downstream so that upstream (e.g., G2D)
+       * can use downstream's proposed buffer pool (e.g., DMA-BUF pools from
+       * tensor_filter for zero-copy inference). */
+      gboolean alloc_ret;
+      GstPad *peer = gst_pad_get_peer (self->srcpad);
+      if (G_UNLIKELY (!peer)) {
+        GST_WARNING_OBJECT (self,
+            "ALLOCATION query: srcpad has no peer, cannot forward");
+        return FALSE;
+      }
+      alloc_ret = gst_pad_query (peer, query);
+      GST_DEBUG_OBJECT (self,
+          "ALLOCATION query forwarded to %s:%s, ret=%d, pools=%u",
+          GST_DEBUG_PAD_NAME (peer), alloc_ret,
+          gst_query_get_n_allocation_pools (query));
+      gst_object_unref (peer);
+      return alloc_ret;
+    }
     default:
       break;
   }

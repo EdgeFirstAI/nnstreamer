@@ -27,9 +27,15 @@
  */
 
 #include <algorithm>
+#include <dlfcn.h>
+#include <errno.h>
 #include <limits.h>
+#include <sys/mman.h>
 #include <thread>
 #include <unistd.h>
+
+#include <gst/gst.h>
+#include <gst/allocators/gstdmabuf.h>
 
 #include <nnstreamer_log.h>
 #include <nnstreamer_plugin_api_util.h>
@@ -151,6 +157,8 @@ typedef struct {
   QNNBackendType qnn_backend_type; /**< QNN Delegate backend type */
   QNNPerformanceMode qnn_performance_mode; /**< QNN Delegate performance mode */
   bool use_default_delegates; /**< whether to use default delegates in resolver */
+  const gchar *camera_adaptor_format; /**< e.g., "rgbx", "rgba", "bgra"; NULL if disabled */
+  bool dmabuf_enabled; /**< DmaBuf:true enables DMA-BUF zero-copy; false = sysmem (default) */
 } tflite_option_s;
 
 /**
@@ -171,6 +179,262 @@ static GstTensorFilterFrameworkStatistics tflite_internal_stats = {
   .total_invoke_latency = 0,
   .total_overhead_latency = 0,
 };
+
+/**
+ * @brief Local definition of VxDmaBufDesc, matching vx_delegate_dmabuf.h.
+ *
+ * Since NNStreamer loads the delegate via dlsym (no compile-time dependency),
+ * we define a compatible struct here for the RequestDmaBuf output parameter.
+ */
+typedef struct {
+  int fd;           /**< DMA-BUF file descriptor */
+  size_t size;      /**< Buffer size in bytes */
+  void *map_ptr;    /**< Optional mmap'd pointer (NULL if not mapped) */
+} VxDmaBufDesc;
+
+/**
+ * @brief VxDelegate DMA-BUF API function pointers loaded via dlsym.
+ *
+ * These are loaded at runtime from the external delegate library (libvx_delegate.so)
+ * for backward compatibility — older delegate versions and platforms without NPU
+ * hardware simply won't have these symbols, and inference falls back to CPU paths.
+ */
+typedef struct {
+  gboolean loaded;       /**< TRUE if dlsym loading was attempted */
+  gboolean available;    /**< TRUE if core DMA-BUF symbols were found */
+
+  /* Core DMA-BUF registration */
+  TfLiteBufferHandle (*RegisterDmaBuf) (TfLiteDelegate *, int, size_t, int);
+  TfLiteStatus (*UnregisterDmaBuf) (TfLiteDelegate *, TfLiteBufferHandle);
+  TfLiteStatus (*BindDmaBufToTensor) (TfLiteDelegate *, TfLiteBufferHandle, int);
+  gboolean (*IsDmaBufSupported) (TfLiteDelegate *);
+
+  /* Cache synchronization */
+  TfLiteStatus (*SyncForDevice) (TfLiteDelegate *, TfLiteBufferHandle);
+  TfLiteStatus (*SyncForCpu) (TfLiteDelegate *, TfLiteBufferHandle);
+
+  /* Output DMA-BUF allocation (export mode) */
+  TfLiteBufferHandle (*RequestDmaBuf) (TfLiteDelegate *, int, int, void *);
+  TfLiteStatus (*ReleaseDmaBuf) (TfLiteDelegate *, TfLiteBufferHandle);
+  int (*GetDmaBufFd) (TfLiteDelegate *, TfLiteBufferHandle);
+
+  /* Granular CPU access bracketing */
+  TfLiteStatus (*BeginCpuAccess) (TfLiteDelegate *, TfLiteBufferHandle, int);
+  TfLiteStatus (*EndCpuAccess) (TfLiteDelegate *, TfLiteBufferHandle, int);
+
+  /* Retrieve the inner DerivedDelegateData* (TfLiteExternalDelegate wraps it) */
+  TfLiteDelegate *(*GetInstance) (void);
+} VxDmaBufAPI;
+
+static VxDmaBufAPI vx_dmabuf_api = {};
+
+/**
+ * @brief VxDelegate CameraAdaptor API function pointers loaded via dlsym.
+ *
+ * CameraAdaptor injects NPU-side Slice/Reverse ops for channel format
+ * conversion (e.g., 4ch RGBx → 3ch RGB) so the CPU videoconvert element
+ * can be eliminated from the pipeline.
+ */
+typedef struct {
+  gboolean loaded;       /**< TRUE if dlsym loading was attempted */
+  gboolean available;    /**< TRUE if core CameraAdaptor symbols were found */
+
+  TfLiteStatus (*SetFormat) (TfLiteDelegate *, int, const char *);
+  TfLiteStatus (*SetFormats) (TfLiteDelegate *, int, const char *, const char *);
+  gboolean (*IsSupported) (const char *);
+  int (*GetInputChannels) (const char *);
+  int (*GetOutputChannels) (const char *);
+} VxCameraAdaptorAPI;
+
+static VxCameraAdaptorAPI vx_camera_api = {};
+
+/**
+ * @brief Load VxDelegate CameraAdaptor API symbols via dlsym.
+ * @param lib_path Path to the external delegate shared library.
+ */
+static void
+vx_camera_api_load (const char *lib_path)
+{
+  void *handle;
+
+  if (vx_camera_api.loaded || !lib_path)
+    return;
+
+  vx_camera_api.loaded = TRUE;
+
+  handle = dlopen (lib_path, RTLD_LAZY | RTLD_NOLOAD);
+  if (!handle)
+    handle = dlopen (lib_path, RTLD_LAZY);
+  if (!handle) {
+    nns_logi ("VxDelegate CameraAdaptor API not available: %s", dlerror ());
+    return;
+  }
+
+#define LOAD_VX_CAM_SYM(field, sym) \
+  *(void **) (&vx_camera_api.field) = dlsym (handle, sym)
+
+  LOAD_VX_CAM_SYM (SetFormat, "VxCameraAdaptorSetFormat");
+  LOAD_VX_CAM_SYM (SetFormats, "VxCameraAdaptorSetFormats");
+  LOAD_VX_CAM_SYM (IsSupported, "VxCameraAdaptorIsSupported");
+  LOAD_VX_CAM_SYM (GetInputChannels, "VxCameraAdaptorGetInputChannels");
+  LOAD_VX_CAM_SYM (GetOutputChannels, "VxCameraAdaptorGetOutputChannels");
+
+#undef LOAD_VX_CAM_SYM
+
+  if (vx_camera_api.SetFormat && vx_camera_api.IsSupported
+      && vx_camera_api.GetInputChannels) {
+    vx_camera_api.available = TRUE;
+    nns_logi ("VxDelegate CameraAdaptor API loaded from %s", lib_path);
+  } else {
+    nns_logi ("VxDelegate CameraAdaptor API not found in %s "
+        "(symbols missing — older delegate version)", lib_path);
+  }
+}
+
+/**
+ * @brief Load VxDelegate DMA-BUF API symbols via dlsym.
+ * @param lib_path Path to the external delegate shared library.
+ *
+ * Uses RTLD_NOLOAD first to check if already loaded (by TfLiteExternalDelegateCreate),
+ * then falls back to RTLD_LAZY. This is safe to call multiple times — subsequent
+ * calls are no-ops.
+ */
+static void
+vx_dmabuf_api_load (const char *lib_path)
+{
+  void *handle;
+
+  if (vx_dmabuf_api.loaded || !lib_path)
+    return;
+
+  vx_dmabuf_api.loaded = TRUE;
+
+  /* The library should already be loaded by TfLiteExternalDelegateCreate */
+  handle = dlopen (lib_path, RTLD_LAZY | RTLD_NOLOAD);
+  if (!handle)
+    handle = dlopen (lib_path, RTLD_LAZY);
+  if (!handle) {
+    nns_logi ("VxDelegate DMA-BUF API not available: %s", dlerror ());
+    return;
+  }
+
+#define LOAD_VX_SYM(field, sym) \
+  *(void **) (&vx_dmabuf_api.field) = dlsym (handle, sym)
+
+  LOAD_VX_SYM (RegisterDmaBuf, "VxDelegateRegisterDmaBuf");
+  LOAD_VX_SYM (UnregisterDmaBuf, "VxDelegateUnregisterDmaBuf");
+  LOAD_VX_SYM (BindDmaBufToTensor, "VxDelegateBindDmaBufToTensor");
+  LOAD_VX_SYM (IsDmaBufSupported, "VxDelegateIsDmaBufSupported");
+  LOAD_VX_SYM (SyncForDevice, "VxDelegateSyncForDevice");
+  LOAD_VX_SYM (SyncForCpu, "VxDelegateSyncForCpu");
+
+  /* Output DMA-BUF allocation (optional) */
+  LOAD_VX_SYM (RequestDmaBuf, "VxDelegateRequestDmaBuf");
+  LOAD_VX_SYM (ReleaseDmaBuf, "VxDelegateReleaseDmaBuf");
+  LOAD_VX_SYM (GetDmaBufFd, "VxDelegateGetDmaBufFd");
+  LOAD_VX_SYM (BeginCpuAccess, "VxDelegateBeginCpuAccess");
+  LOAD_VX_SYM (EndCpuAccess, "VxDelegateEndCpuAccess");
+  LOAD_VX_SYM (GetInstance, "VxDelegateGetInstance");
+
+#undef LOAD_VX_SYM
+
+  /* Require the core symbols for DMA-BUF to be considered available */
+  if (vx_dmabuf_api.RegisterDmaBuf && vx_dmabuf_api.UnregisterDmaBuf
+      && vx_dmabuf_api.BindDmaBufToTensor && vx_dmabuf_api.IsDmaBufSupported) {
+    vx_dmabuf_api.available = TRUE;
+    nns_logi ("VxDelegate DMA-BUF API loaded from %s", lib_path);
+  } else {
+    nns_logi ("VxDelegate DMA-BUF API partially available from %s "
+        "(some symbols missing)", lib_path);
+  }
+
+  /* Don't dlclose — the library is in use by the delegate */
+}
+
+/* ========== NnsDmaBufInputPool: single DMA-BUF buffer pool ========== */
+
+typedef struct {
+  GstBufferPool parent;
+  int fd;           /**< delegate-allocated DMA-BUF fd */
+  gsize buf_size;   /**< buffer size in bytes */
+} NnsDmaBufInputPool;
+
+typedef struct {
+  GstBufferPoolClass parent_class;
+} NnsDmaBufInputPoolClass;
+
+static GType nns_dmabuf_input_pool_get_type (void);
+
+static GstFlowReturn
+nns_dmabuf_pool_alloc (GstBufferPool *pool, GstBuffer **buffer,
+    GstBufferPoolAcquireParams *params)
+{
+  NnsDmaBufInputPool *self = (NnsDmaBufInputPool *) pool;
+  UNUSED (params);
+
+  GstAllocator *alloc = gst_dmabuf_allocator_new ();
+  GstMemory *mem = gst_dmabuf_allocator_alloc_with_flags (
+      alloc, self->fd, self->buf_size, GST_FD_MEMORY_FLAG_DONT_CLOSE);
+  gst_object_unref (alloc);
+
+  if (G_UNLIKELY (!mem))
+    return GST_FLOW_ERROR;
+
+  *buffer = gst_buffer_new ();
+  gst_buffer_append_memory (*buffer, mem);
+  return GST_FLOW_OK;
+}
+
+static gboolean
+nns_dmabuf_pool_set_config (GstBufferPool *pool, GstStructure *config)
+{
+  /* This pool wraps a single delegate-owned DMA-BUF fd. Multiple buffers
+   * would all reference the same fd, causing data corruption. Force 1. */
+  GstCaps *caps;
+  guint size, min, max;
+  gst_buffer_pool_config_get_params (config, &caps, &size, &min, &max);
+  if (min != 1 || max != 1) {
+    gst_buffer_pool_config_set_params (config, caps,
+        ((NnsDmaBufInputPool *) pool)->buf_size, 1, 1);
+  }
+  return GST_BUFFER_POOL_CLASS (g_type_class_peek_parent (
+      G_OBJECT_GET_CLASS (pool)))->set_config (pool, config);
+}
+
+static void
+nns_dmabuf_pool_class_init (gpointer klass, gpointer class_data)
+{
+  UNUSED (class_data);
+  GST_BUFFER_POOL_CLASS (klass)->alloc_buffer = nns_dmabuf_pool_alloc;
+  GST_BUFFER_POOL_CLASS (klass)->set_config = nns_dmabuf_pool_set_config;
+}
+
+static void
+nns_dmabuf_pool_init (GTypeInstance *instance, gpointer g_class)
+{
+  NnsDmaBufInputPool *self = (NnsDmaBufInputPool *) instance;
+  UNUSED (g_class);
+  self->fd = -1;
+  self->buf_size = 0;
+}
+
+static GType
+nns_dmabuf_input_pool_get_type (void)
+{
+  static gsize type_id = 0;
+  if (g_once_init_enter (&type_id)) {
+    GTypeInfo info = {
+      sizeof (NnsDmaBufInputPoolClass), NULL, NULL,
+      nns_dmabuf_pool_class_init, NULL, NULL,
+      sizeof (NnsDmaBufInputPool), 0,
+      nns_dmabuf_pool_init, NULL
+    };
+    GType t = g_type_register_static (
+        GST_TYPE_BUFFER_POOL, "NnsDmaBufInputPool", &info, (GTypeFlags) 0);
+    g_once_init_leave (&type_id, t);
+  }
+  return (GType) type_id;
+}
 
 /**
  * @brief Wrapper class for TFLite Interpreter to support model switching
@@ -194,6 +458,11 @@ class TFLiteInterpreter
   void setUseDefaultDelegates (gboolean use_default)
   {
     use_default_delegates = use_default;
+  }
+  void setCameraAdaptorFormat (const char *format)
+  {
+    g_free (camera_adaptor_format);
+    camera_adaptor_format = format ? g_strdup (format) : nullptr;
   }
   /** @brief get current model path */
   const char *getModelPath ()
@@ -248,6 +517,7 @@ class TFLiteInterpreter
   QNNBackendType qnn_backend_type; /**< QNN Delegate backend type */
   QNNPerformanceMode qnn_performance_mode; /**< QNN Delegate performance mode */
   bool use_default_delegates; /**< whether to use default delegates in resolver */
+  char *camera_adaptor_format; /**< Camera format (e.g., "rgbx"), NULL if disabled */
 
   std::unique_ptr<tflite::Interpreter> interpreter;
   std::unique_ptr<tflite::FlatBufferModel> model;
@@ -285,6 +555,80 @@ class TFLiteCore
   int invoke (const GstTensorMemory *input, GstTensorMemory *output);
   /** @brief cache input and output tensor ptr before invoke */
   int cacheInOutTensorPtr ();
+
+  /** @brief Get the TfLite delegate pointer (for VxDelegate DMA-BUF API calls) */
+  TfLiteDelegate *getDelegate ()
+  {
+    return interpreter ? interpreter->getDelegate () : nullptr;
+  }
+  /** @brief Get the underlying tflite::Interpreter for direct Invoke() */
+  tflite::Interpreter *getTfLiteInterpreter ()
+  {
+    return interpreter ? interpreter->interpreter.get () : nullptr;
+  }
+  /** @brief Get cached input tensor pointer by index */
+  TfLiteTensor *getInputTensorPtr (unsigned int i)
+  {
+    return (interpreter && i < interpreter->inputTensorPtr.size ())
+        ? interpreter->inputTensorPtr[i] : nullptr;
+  }
+  /** @brief Get cached output tensor pointer by index */
+  TfLiteTensor *getOutputTensorPtr (unsigned int i)
+  {
+    return (interpreter && i < interpreter->outputTensorPtr.size ())
+        ? interpreter->outputTensorPtr[i] : nullptr;
+  }
+  /** @brief Get the external delegate library path */
+  const char *getExtDelegatePath ()
+  {
+    return interpreter ? interpreter->ext_delegate_path : nullptr;
+  }
+
+  /** @brief Release output DMA-BUF handles (call before interpreter destruction) */
+  void releaseOutputDmaBuf ();
+  /** @brief Request output DMA-BUFs from VxDelegate (call after model load) */
+  gboolean setupOutputDmaBuf ();
+
+  /** @brief Release input DMA-BUF handle and pool */
+  void releaseInputDmaBuf ();
+  /** @brief Request input DMA-BUF from VxDelegate and create buffer pool */
+  gboolean setupInputDmaBuf ();
+
+  /** @brief Check if CameraAdaptor is active for this instance */
+  gboolean hasCameraAdaptor () { return camera_adaptor.active; }
+
+  /* CameraAdaptor state: NPU-side 4ch→3ch conversion */
+  struct {
+    gboolean active;       /**< TRUE if CameraAdaptor is configured */
+    gchar *format;         /**< "rgbx", "rgba", etc. */
+    int camera_channels;   /**< 4 for RGBx */
+    int model_channels;    /**< 3 for RGB */
+  } camera_adaptor;
+
+  /* Phase 2: Output DMA-BUF state */
+  struct {
+    gboolean initialized;  /**< TRUE if output DMA-BUFs were requested */
+    unsigned int num_outputs;
+    TfLiteBufferHandle handles[NNS_TENSOR_SIZE_LIMIT];
+    int fds[NNS_TENSOR_SIZE_LIMIT];
+    gsize sizes[NNS_TENSOR_SIZE_LIMIT];
+  } out_dmabuf;
+
+  /* Phase 3: Input DMA-BUF state (delegate-owned, proposed upstream via pool) */
+  struct {
+    gboolean initialized;  /**< TRUE if input DMA-BUF was allocated */
+    TfLiteBufferHandle handle;
+    int fd;
+    gsize size;            /**< actual buffer size (may differ from tensor->bytes with CameraAdaptor) */
+    void *map_ptr;         /**< mmap'd pointer to DMA-BUF for CPU memcpy fallback */
+    GstBufferPool *pool;   /**< pool wrapping the DMA-BUF fd, proposed upstream */
+  } in_dmabuf;
+
+  bool dmabuf_enabled = false; /**< Whether DMA-BUF zero-copy is enabled for this instance */
+
+  /** @brief Check whether DMA-BUF zero-copy is enabled */
+  bool isDmaBufEnabled () const { return dmabuf_enabled; }
+
   /** @brief callback method to delete interpreter for shared model */
   friend void free_interpreter (void *instance);
   /** @brief callback method to replace interpreter for shared model */
@@ -322,6 +666,7 @@ TFLiteInterpreter::TFLiteInterpreter ()
   model_path = nullptr;
   ext_delegate_path = nullptr;
   ext_delegate_kv_table = nullptr;
+  camera_adaptor_format = nullptr;
   qnn_backend_type = QNN_BACKEND_UNDEFINED;
   qnn_performance_mode = QNN_PERFMODE_Default;
   use_default_delegates = FALSE;
@@ -344,6 +689,7 @@ TFLiteInterpreter::~TFLiteInterpreter ()
   g_mutex_clear (&mutex);
   g_free (model_path);
   g_free (ext_delegate_path);
+  g_free (camera_adaptor_format);
   if (ext_delegate_kv_table)
     g_hash_table_unref (ext_delegate_kv_table);
 
@@ -644,6 +990,29 @@ TFLiteInterpreter::loadModel (int num_threads, tflite_delegate_e delegate_e)
       }
     default:
       break;
+  }
+
+  /* Configure CameraAdaptor — MUST happen BEFORE ModifyGraphWithDelegate
+   * because Init() reads camera_adaptor_configs to inject Slice ops. */
+  if (camera_adaptor_format && delegate_e == TFLITE_DELEGATE_EXTERNAL) {
+    vx_camera_api_load (ext_delegate_path);
+    vx_dmabuf_api_load (ext_delegate_path);
+
+    if (vx_camera_api.available && vx_dmabuf_api.GetInstance) {
+      TfLiteDelegate *inner_dlg = vx_dmabuf_api.GetInstance ();
+      if (inner_dlg) {
+        int tensor_idx = interpreter->inputs ()[0];
+        TfLiteStatus cam_status = vx_camera_api.SetFormat (
+            inner_dlg, tensor_idx, camera_adaptor_format);
+        if (cam_status == kTfLiteOk)
+          nns_logi ("CameraAdaptor configured: format=%s tensor=%d",
+              camera_adaptor_format, tensor_idx);
+        else
+          ml_logw ("CameraAdaptor SetFormat failed for '%s'",
+              camera_adaptor_format);
+      }
+    }
+
   }
 
   delegate = getDelegate ();
@@ -969,6 +1338,10 @@ TFLiteCore::TFLiteCore (const GstTensorFilterProperties *prop)
 
   if (interpreter == NULL)
     nns_logd ("Failed to allocate memory for interpreter");
+
+  memset (&out_dmabuf, 0, sizeof (out_dmabuf));
+  memset (&in_dmabuf, 0, sizeof (in_dmabuf));
+  memset (&camera_adaptor, 0, sizeof (camera_adaptor));
 }
 
 /**
@@ -987,6 +1360,9 @@ free_interpreter (void *interpreter)
  */
 TFLiteCore::~TFLiteCore ()
 {
+  g_free (camera_adaptor.format);
+  camera_adaptor.format = NULL;
+
   if (shared_tensor_filter_key) {
     G_LOCK (slock);
     if (!nnstreamer_filter_shared_model_remove (this, shared_tensor_filter_key, free_interpreter)) {
@@ -1080,9 +1456,11 @@ TFLiteCore::setAccelerator (const char *accelerators, tflite_delegate_e d)
 int
 TFLiteCore::init (tflite_option_s *option)
 {
+  dmabuf_enabled = option->dmabuf_enabled;
   interpreter->setModelPath (option->model_file);
   interpreter->setExtDelegate (option->ext_delegate_path, option->ext_delegate_kv_table);
   interpreter->setUseDefaultDelegates (option->use_default_delegates);
+  interpreter->setCameraAdaptorFormat (option->camera_adaptor_format);
   interpreter->qnn_backend_type = option->qnn_backend_type;
   interpreter->qnn_performance_mode = option->qnn_performance_mode;
   num_threads = option->num_threads;
@@ -1096,6 +1474,27 @@ TFLiteCore::init (tflite_option_s *option)
         err, option->model_file);
     return -1;
   }
+
+  /* Set up CameraAdaptor state after loadModel configured the delegate */
+  if (option->camera_adaptor_format && vx_camera_api.available) {
+    int cam_ch = vx_camera_api.GetInputChannels
+        ? vx_camera_api.GetInputChannels (option->camera_adaptor_format) : 0;
+    int mdl_ch = vx_camera_api.GetOutputChannels
+        ? vx_camera_api.GetOutputChannels (option->camera_adaptor_format) : 0;
+
+    if (cam_ch > 0 && mdl_ch > 0) {
+      camera_adaptor.active = TRUE;
+      camera_adaptor.format = g_strdup (option->camera_adaptor_format);
+      camera_adaptor.camera_channels = cam_ch;
+      camera_adaptor.model_channels = mdl_ch;
+      nns_logi ("CameraAdaptor active: %s (%dch -> %dch)",
+          camera_adaptor.format, cam_ch, mdl_ch);
+    } else {
+      ml_logw ("CameraAdaptor format '%s' not usable (input_ch=%d output_ch=%d)",
+          option->camera_adaptor_format, cam_ch, mdl_ch);
+    }
+  }
+
   if (setInputTensorProp ()) {
     ml_loge ("Failed to initialize input tensor\n");
     return -2;
@@ -1188,6 +1587,23 @@ TFLiteCore::getInputTensorDim (GstTensorsInfo *info)
   interpreter->lock ();
   gst_tensors_info_copy (info, interpreter->getInputTensorsInfo ());
   interpreter->unlock ();
+
+  /* Override input tensor info for CameraAdaptor: report camera's 4ch
+   * and uint8 type to GStreamer so caps negotiate with RGBA tensor from
+   * tensor_converter. Internal TFLite tensors remain at model's native
+   * 3ch int8. The NPU's Slice (4ch→3ch) and DataConvert (uint8→int8)
+   * ops handle the conversion during inference. */
+  if (camera_adaptor.active && info->num_tensors > 0) {
+    GstTensorInfo *ti = gst_tensors_info_get_nth_info (info, 0);
+    if (ti->dimension[0] == (guint) camera_adaptor.model_channels) {
+      ti->dimension[0] = camera_adaptor.camera_channels;
+    }
+    /* CameraAdaptor DataConvert handles int8→uint8 on NPU, so report
+     * uint8 to GStreamer for correct caps negotiation */
+    if (ti->type == _NNS_INT8) {
+      ti->type = _NNS_UINT8;
+    }
+  }
 
   return 0;
 }
@@ -1370,6 +1786,211 @@ TFLiteCore::cacheInOutTensorPtr ()
 }
 
 /**
+ * @brief Request output DMA-BUFs from VxDelegate for zero-copy output.
+ * @return TRUE if output DMA-BUFs were successfully set up.
+ */
+gboolean
+TFLiteCore::setupOutputDmaBuf ()
+{
+  if (out_dmabuf.initialized || !vx_dmabuf_api.available
+      || !vx_dmabuf_api.RequestDmaBuf || !vx_dmabuf_api.GetDmaBufFd
+      || !vx_dmabuf_api.GetInstance)
+    return out_dmabuf.initialized;
+
+  /* Get the inner VxDelegate pointer (not the TfLiteExternalDelegate wrapper) */
+  TfLiteDelegate *dlg = vx_dmabuf_api.GetInstance ();
+  tflite::Interpreter *interp = getTfLiteInterpreter ();
+  if (!dlg || !interp)
+    return FALSE;
+
+  unsigned int num_out = interp->outputs ().size ();
+  for (unsigned int i = 0; i < num_out; i++) {
+    int tensor_idx = interp->outputs ()[i];
+    TfLiteTensor *tensor = interp->tensor (tensor_idx);
+    if (!tensor || tensor->bytes == 0) {
+      nns_logi ("Output tensor %d has no size, skipping DMA-BUF", tensor_idx);
+      releaseOutputDmaBuf ();
+      return FALSE;
+    }
+
+    /* Populate descriptor with required buffer size for allocation */
+    VxDmaBufDesc desc = { .fd = -1, .size = tensor->bytes, .map_ptr = NULL };
+
+    /* kVxDmaBufOwnerDelegate = 1 (delegate allocates and owns the buffer) */
+    TfLiteBufferHandle h = vx_dmabuf_api.RequestDmaBuf (
+        dlg, tensor_idx, 1 /* kVxDmaBufOwnerDelegate */, &desc);
+    if (h == kTfLiteNullBufferHandle) {
+      nns_logi ("Output DMA-BUF request failed for tensor %d (%zu bytes), "
+          "using CPU path", tensor_idx, tensor->bytes);
+      releaseOutputDmaBuf ();
+      return FALSE;
+    }
+
+    /* Use fd from descriptor if populated, otherwise query via GetDmaBufFd */
+    int fd = (desc.fd >= 0) ? desc.fd : vx_dmabuf_api.GetDmaBufFd (dlg, h);
+    if (fd < 0) {
+      nns_logi ("Output DMA-BUF fd retrieval failed for tensor %d", tensor_idx);
+      vx_dmabuf_api.ReleaseDmaBuf (dlg, h);
+      releaseOutputDmaBuf ();
+      return FALSE;
+    }
+
+    /* Bind output DMA-BUF to tensor so NPU writes directly to it */
+    vx_dmabuf_api.BindDmaBufToTensor (dlg, h, tensor_idx);
+
+    out_dmabuf.handles[i] = h;
+    out_dmabuf.fds[i] = fd;
+    out_dmabuf.sizes[i] = tensor->bytes;
+  }
+
+  out_dmabuf.num_outputs = num_out;
+  out_dmabuf.initialized = TRUE;
+  nns_logi ("Output DMA-BUF enabled: %u output tensors bound", num_out);
+  return TRUE;
+}
+
+/**
+ * @brief Release output DMA-BUF handles.
+ */
+void
+TFLiteCore::releaseOutputDmaBuf ()
+{
+  if (!out_dmabuf.initialized)
+    return;
+
+  TfLiteDelegate *dlg = vx_dmabuf_api.GetInstance
+      ? vx_dmabuf_api.GetInstance () : getDelegate ();
+  if (dlg && vx_dmabuf_api.ReleaseDmaBuf) {
+    for (unsigned int i = 0; i < out_dmabuf.num_outputs; i++) {
+      if (out_dmabuf.handles[i] != kTfLiteNullBufferHandle)
+        vx_dmabuf_api.ReleaseDmaBuf (dlg, out_dmabuf.handles[i]);
+    }
+  }
+
+  memset (&out_dmabuf, 0, sizeof (out_dmabuf));
+}
+
+/**
+ * @brief Request input DMA-BUF from VxDelegate and create a buffer pool.
+ *
+ * Allocates a delegate-owned DMA-BUF for input tensor 0, binds it persistently,
+ * and wraps it in a GstBufferPool that can be proposed upstream via the
+ * allocation query. Upstream elements (e.g., imxvideoconvert_g2d) that honor
+ * the pool will write directly into this buffer, achieving true zero-copy.
+ *
+ * With CameraAdaptor active, the allocated buffer size accounts for 4-channel
+ * upstream data (e.g., RGBx 200704 bytes) even though the model tensor is
+ * 3-channel (e.g., RGB 150528 bytes).
+ */
+gboolean
+TFLiteCore::setupInputDmaBuf ()
+{
+  if (in_dmabuf.initialized || !vx_dmabuf_api.available
+      || !vx_dmabuf_api.RequestDmaBuf || !vx_dmabuf_api.GetDmaBufFd
+      || !vx_dmabuf_api.GetInstance)
+    return FALSE;
+
+  TfLiteDelegate *dlg = vx_dmabuf_api.GetInstance ();
+  tflite::Interpreter *interp = getTfLiteInterpreter ();
+  if (!dlg || !interp || interp->inputs ().empty ())
+    return FALSE;
+
+  int tensor_idx = interp->inputs ()[0];
+  TfLiteTensor *tensor = interp->tensor (tensor_idx);
+  if (!tensor || tensor->bytes == 0)
+    return FALSE;
+
+  /* Compute actual buffer size — with CameraAdaptor, upstream sends
+   * 4ch (e.g., 200704 bytes) but model tensor is 3ch (150528 bytes) */
+  gsize alloc_size = tensor->bytes;
+  if (camera_adaptor.active && camera_adaptor.model_channels > 0) {
+    alloc_size = (tensor->bytes / camera_adaptor.model_channels)
+        * camera_adaptor.camera_channels;
+  }
+
+  VxDmaBufDesc desc = { .fd = -1, .size = alloc_size, .map_ptr = NULL };
+  TfLiteBufferHandle h = vx_dmabuf_api.RequestDmaBuf (
+      dlg, tensor_idx, 1 /* kVxDmaBufOwnerDelegate */, &desc);
+  if (h == kTfLiteNullBufferHandle) {
+    nns_logi ("Input DMA-BUF request failed for tensor %d (%zu bytes), "
+        "using per-frame registration path", tensor_idx, alloc_size);
+    return FALSE;
+  }
+
+  /* Use fd from descriptor if populated, otherwise query via GetDmaBufFd */
+  int fd = (desc.fd >= 0) ? desc.fd : vx_dmabuf_api.GetDmaBufFd (dlg, h);
+  if (fd < 0) {
+    vx_dmabuf_api.ReleaseDmaBuf (dlg, h);
+    return FALSE;
+  }
+
+  /* Bind input DMA-BUF to tensor — persists across Invoke() calls */
+  vx_dmabuf_api.BindDmaBufToTensor (dlg, h, tensor_idx);
+
+  /* Create buffer pool wrapping this fd */
+  NnsDmaBufInputPool *pool = (NnsDmaBufInputPool *)
+      g_object_new (nns_dmabuf_input_pool_get_type (), NULL);
+  pool->fd = fd;
+  pool->buf_size = alloc_size;
+
+  GstStructure *config = gst_buffer_pool_get_config (GST_BUFFER_POOL (pool));
+  GstAllocator *dmabuf_alloc = gst_dmabuf_allocator_new ();
+  gst_buffer_pool_config_set_params (config, NULL, alloc_size, 1, 1);
+  gst_buffer_pool_config_set_allocator (config, dmabuf_alloc, NULL);
+  gst_buffer_pool_set_config (GST_BUFFER_POOL (pool), config);
+  gst_object_unref (dmabuf_alloc);
+
+  in_dmabuf.initialized = TRUE;
+  in_dmabuf.handle = h;
+  in_dmabuf.fd = fd;
+  in_dmabuf.size = alloc_size;
+  in_dmabuf.pool = GST_BUFFER_POOL (pool);
+
+  /* mmap the DMA-BUF for CPU memcpy fallback (when upstream doesn't honor
+   * our proposed pool, e.g., G2D provides its own buffers) */
+  in_dmabuf.map_ptr = mmap (NULL, alloc_size, PROT_READ | PROT_WRITE,
+      MAP_SHARED, fd, 0);
+  if (in_dmabuf.map_ptr == MAP_FAILED) {
+    nns_logw ("Input DMA-BUF mmap failed (fd=%d size=%zu): %s — "
+        "CPU fallback for CameraAdaptor will not work", fd, alloc_size,
+        g_strerror (errno));
+    in_dmabuf.map_ptr = NULL;
+  }
+
+  nns_logi ("Input DMA-BUF enabled: tensor=%d fd=%d size=%zu map_ptr=%p",
+      tensor_idx, fd, alloc_size, in_dmabuf.map_ptr);
+  return TRUE;
+}
+
+/**
+ * @brief Release input DMA-BUF handle and pool.
+ */
+void
+TFLiteCore::releaseInputDmaBuf ()
+{
+  if (!in_dmabuf.initialized)
+    return;
+
+  if (in_dmabuf.map_ptr) {
+    munmap (in_dmabuf.map_ptr, in_dmabuf.size);
+  }
+
+  if (in_dmabuf.pool) {
+    gst_buffer_pool_set_active (in_dmabuf.pool, FALSE);
+    gst_object_unref (in_dmabuf.pool);
+  }
+
+  TfLiteDelegate *dlg = vx_dmabuf_api.GetInstance
+      ? vx_dmabuf_api.GetInstance () : getDelegate ();
+  if (dlg && vx_dmabuf_api.ReleaseDmaBuf
+      && in_dmabuf.handle != kTfLiteNullBufferHandle) {
+    vx_dmabuf_api.ReleaseDmaBuf (dlg, in_dmabuf.handle);
+  }
+
+  memset (&in_dmabuf, 0, sizeof (in_dmabuf));
+}
+
+/**
  * @brief Internal function to get the option for tf-lite model.
  */
 static int
@@ -1386,6 +2007,8 @@ tflite_parseCustomOption (const GstTensorFilterProperties *prop, tflite_option_s
   option->ext_delegate_kv_table = nullptr;
   option->qnn_backend_type = QNN_BACKEND_UNDEFINED;
   option->qnn_performance_mode = QNN_PERFMODE_Default;
+  option->camera_adaptor_format = nullptr;
+  option->dmabuf_enabled = false;
 
   if (prop->custom_properties) {
     gchar **strv;
@@ -1469,6 +2092,15 @@ tflite_parseCustomOption (const GstTensorFilterProperties *prop, tflite_option_s
           else
             ml_logw ("Unknown option for QNN perf mode: %s. Please set one of { \"default\", \"highperformance\", \"powersaver\" }",
                 pair[1]);
+        } else if (g_ascii_strcasecmp (pair[0], "CameraAdaptor") == 0) {
+          option->camera_adaptor_format = g_strdup (pair[1]);
+        } else if (g_ascii_strcasecmp (pair[0], "DmaBuf") == 0) {
+          if (g_ascii_strcasecmp (pair[1], "true") == 0 || g_ascii_strcasecmp (pair[1], "1") == 0)
+            option->dmabuf_enabled = true;
+          else if (g_ascii_strcasecmp (pair[1], "false") == 0 || g_ascii_strcasecmp (pair[1], "0") == 0)
+            option->dmabuf_enabled = false;
+          else
+            ml_logw ("Invalid value for DmaBuf (%s). Use 'true' or 'false'.", pair[1]);
         } else {
           ml_logw ("Unknown option (%s).", strv[i]);
         }
@@ -1500,6 +2132,8 @@ tflite_close (const GstTensorFilterProperties *prop, void **private_data)
   if (!core)
     return;
 
+  core->releaseInputDmaBuf ();
+  core->releaseOutputDmaBuf ();
   delete core;
   *private_data = NULL;
 }
@@ -1548,6 +2182,13 @@ tflite_loadModelFile (const GstTensorFilterProperties *prop, void **private_data
 
   *private_data = core;
 
+  /* Only set up DMA-BUF when explicitly enabled via DmaBuf:true */
+  if (core->isDmaBufEnabled ()) {
+    vx_dmabuf_api_load (core->getExtDelegatePath ());
+    core->setupOutputDmaBuf ();
+    core->setupInputDmaBuf ();
+  }
+
 done:
   g_free ((gpointer) option.ext_delegate_path);
   option.ext_delegate_path = nullptr;
@@ -1555,6 +2196,9 @@ done:
   if (option.ext_delegate_kv_table)
     g_hash_table_unref (option.ext_delegate_kv_table);
   option.ext_delegate_kv_table = nullptr;
+
+  g_free ((gpointer) option.camera_adaptor_format);
+  option.camera_adaptor_format = nullptr;
 
   return ret;
 }
@@ -1576,22 +2220,259 @@ tflite_open (const GstTensorFilterProperties *prop, void **private_data)
 }
 
 /**
- * @brief The mandatory callback for GstTensorFilterFramework
- * @param prop property of tensor_filter instance
- * @param private_data : tensorflow lite plugin's private data
- * @param[in] input The array of input tensors
- * @param[out] output The array of output tensors
+ * @brief V2 invoke callback — receives GstMemory* directly without mapping.
+ *
+ * For DMA-BUF inputs (from camera/ISP), registers the fd with VxDelegate
+ * for zero-copy NPU inference. For system memory, falls back to mapping
+ * and pointer assignment (like V0). Output is always allocated as system
+ * memory and copied from TFLite's output tensors.
+ *
+ * @param[in] prop read-only property values
+ * @param[in/out] private_data Sub-plugin's private data (TFLiteCore*)
+ * @param[in] input Array of void* (opaque GstMemory*) for input tensors
+ * @param[in/out] output Array of void* (opaque GstMemory*) for output tensors.
+ *   With allocate_in_invoke=TRUE, these start as NULL and are allocated here.
+ * @param[in] num_input Number of input tensors
+ * @param[in] num_output Number of output tensors
  * @return 0 if OK. non-zero if error.
  */
 static int
-tflite_invoke (const GstTensorFilterProperties *prop, void **private_data,
-    const GstTensorMemory *input, GstTensorMemory *output)
+tflite_invoke_v2 (const GstTensorFilterProperties *prop, void **private_data,
+    void **input, void **output, unsigned int num_input, unsigned int num_output)
 {
   TFLiteCore *core = static_cast<TFLiteCore *> (*private_data);
   g_return_val_if_fail (core && input && output, -EINVAL);
   UNUSED (prop);
 
-  return core->invoke (input, output);
+  tflite::Interpreter *tfl_interp = core->getTfLiteInterpreter ();
+  g_return_val_if_fail (tfl_interp != NULL, -EINVAL);
+
+  /* Get the inner VxDelegate pointer for DMA-BUF API calls */
+  TfLiteDelegate *delegate = vx_dmabuf_api.GetInstance
+      ? vx_dmabuf_api.GetInstance () : core->getDelegate ();
+
+  GstMapInfo in_maps[NNS_TENSOR_SIZE_LIMIT];
+  gboolean in_mapped[NNS_TENSOR_SIZE_LIMIT] = { FALSE, };
+  TfLiteBufferHandle in_handles[NNS_TENSOR_SIZE_LIMIT];
+  gboolean in_dmabuf[NNS_TENSOR_SIZE_LIMIT] = { FALSE, };
+  TfLiteStatus status;
+  int ret = -1;
+
+  /* Initialize handles to null */
+  for (unsigned int i = 0; i < num_input; i++)
+    in_handles[i] = kTfLiteNullBufferHandle;
+
+  /* Check if DMA-BUF zero-copy is available */
+  gboolean use_dmabuf = FALSE;
+  if (delegate && vx_dmabuf_api.available && vx_dmabuf_api.IsDmaBufSupported) {
+    use_dmabuf = vx_dmabuf_api.IsDmaBufSupported (delegate);
+  }
+
+  int64_t start_time = g_get_monotonic_time ();
+
+  /* 1. Set up input tensors */
+  for (unsigned int i = 0; i < num_input; i++) {
+    GstMemory *mem = (GstMemory *) input[i];
+    TfLiteTensor *tensor = core->getInputTensorPtr (i);
+
+    if (G_UNLIKELY (!tensor)) {
+      ml_loge ("tflite_invoke_v2: input tensor %u not cached", i);
+      goto cleanup;
+    }
+
+    if (use_dmabuf && gst_is_dmabuf_memory (mem)) {
+      /* Zero-copy DMA-BUF path */
+      int fd = gst_dmabuf_memory_get_fd (mem);
+      gsize size = gst_memory_get_sizes (mem, NULL, NULL);
+
+      /* Check if this is our pre-allocated input DMA-BUF (already bound) */
+      if (core->in_dmabuf.initialized && fd == core->in_dmabuf.fd) {
+        /* Skip registration — buffer is already bound to tensor */
+        in_dmabuf[i] = TRUE;
+        in_handles[i] = kTfLiteNullBufferHandle;  /* nothing to unregister */
+        continue;
+      }
+
+      /* CameraAdaptor: per-frame DMA-BUF rebinding is incompatible with the
+       * compiled TIM-VX graph — the CameraAdaptor Slice op reads from the
+       * delegate-owned DMA-BUF (fd=N) that was bound during graph compilation.
+       * BindDmaBufToTensor does not propagate through the compiled graph, so
+       * the NPU would read stale data from the original fd instead of the new
+       * one.  Fall through to the CPU memcpy fallback which copies into the
+       * delegate-owned DMA-BUF where the graph expects it. */
+      if (core->hasCameraAdaptor () && i == 0 && core->in_dmabuf.initialized) {
+        /* Fall through to CPU path — gst_memory_map works on DMA-BUF memory */
+      } else {
+        /* Per-frame registration path (external DMA-BUF, no CameraAdaptor) */
+        in_handles[i] = vx_dmabuf_api.RegisterDmaBuf (
+            delegate, fd, size, 0 /* kVxDmaBufSyncNone */);
+        if (in_handles[i] != kTfLiteNullBufferHandle) {
+          int tensor_idx = tfl_interp->inputs ()[i];
+          vx_dmabuf_api.BindDmaBufToTensor (delegate, in_handles[i], tensor_idx);
+          in_dmabuf[i] = TRUE;
+          continue;
+        }
+        /* Fall through to CPU path on registration failure */
+        ml_logw ("tflite_invoke_v2: DMA-BUF registration failed for input %u, "
+            "falling back to CPU path", i);
+      }
+    }
+
+    /* CPU fallback: map GstMemory and set tensor data pointer */
+    if (!gst_memory_map (mem, &in_maps[i], GST_MAP_READ)) {
+      ml_loge ("tflite_invoke_v2: failed to map input memory %u", i);
+      goto cleanup;
+    }
+    in_mapped[i] = TRUE;
+
+    if (core->hasCameraAdaptor () && i == 0
+        && core->in_dmabuf.initialized && core->in_dmabuf.map_ptr) {
+      /* CameraAdaptor memcpy fallback: upstream (e.g., G2D) provided a regular
+       * buffer instead of our proposed DMA-BUF pool.  Copy the 4ch RGBA data
+       * into the delegate-owned input DMA-BUF so the NPU can run Slice
+       * (4ch→3ch) and DataConvert (uint8→int8) via CameraAdaptor. */
+      gsize copy_size = MIN (in_maps[i].size, core->in_dmabuf.size);
+      memcpy (core->in_dmabuf.map_ptr, in_maps[i].data, copy_size);
+
+      /* Flush CPU caches so NPU reads the data we just wrote.
+       * The delegate-owned DMA-BUF has an active NPU device attachment,
+       * so DMA_BUF_IOCTL_SYNC (called internally by SyncForDevice)
+       * performs actual cache maintenance. Without this, the NPU would
+       * read stale data from cache on cached CMA heap buffers. */
+      if (vx_dmabuf_api.SyncForDevice && delegate
+          && core->in_dmabuf.handle != kTfLiteNullBufferHandle) {
+        vx_dmabuf_api.SyncForDevice (delegate, core->in_dmabuf.handle);
+      }
+
+      static gboolean cam_copy_logged = FALSE;
+      if (G_UNLIKELY (!cam_copy_logged)) {
+        cam_copy_logged = TRUE;
+        nns_logi ("CameraAdaptor memcpy fallback: %zu bytes → DMA-BUF fd=%d "
+            "(upstream did not honor proposed pool)", copy_size,
+            core->in_dmabuf.fd);
+      }
+
+      /* The DMA-BUF is already bound to tensor 0 from setupInputDmaBuf(),
+       * so no registration needed — just mark it and continue. */
+      in_dmabuf[i] = TRUE;
+      in_handles[i] = kTfLiteNullBufferHandle;
+      continue;
+    }
+
+    if (core->hasCameraAdaptor () && i == 0) {
+      /* CameraAdaptor active but no delegate-owned DMA-BUF available —
+       * the CPU path cannot handle 4ch→3ch conversion. */
+      ml_loge ("CameraAdaptor active but no input DMA-BUF for memcpy fallback. "
+          "Inference will likely fail.");
+    }
+
+    tensor->data.raw = (char *) in_maps[i].data;
+  }
+
+  /* For non-DMA-BUF outputs, set tensor pointers to pre-allocated memory.
+   * Note: with allocate_in_invoke=TRUE, we don't set output pointers —
+   * TFLite uses its internal buffers, and we copy after invoke. */
+
+  {
+    int64_t stop_time = g_get_monotonic_time ();
+    tflite_internal_stats.total_overhead_latency += stop_time - start_time;
+  }
+
+  /* First-invoke DMA-BUF status logging (one-time) */
+  {
+    static gboolean first_invoke_logged = FALSE;
+    if (G_UNLIKELY (!first_invoke_logged)) {
+      first_invoke_logged = TRUE;
+      nns_logi ("tflite_invoke_v2 first frame: input_dmabuf=%s output_dmabuf=%s "
+          "input_pool=%s delegate=%p", use_dmabuf ? "yes" : "no",
+          core->out_dmabuf.initialized ? "yes" : "no",
+          core->in_dmabuf.initialized ? "yes" : "no", delegate);
+    }
+  }
+
+  /* 2. Invoke the model */
+  start_time = g_get_monotonic_time ();
+  status = tfl_interp->Invoke ();
+  {
+    int64_t stop_time = g_get_monotonic_time ();
+    tflite_internal_stats.total_invoke_latency += stop_time - start_time;
+    tflite_internal_stats.total_invoke_num += 1;
+  }
+
+  if (status != kTfLiteOk) {
+    ml_loge ("tflite_invoke_v2: TFLite Invoke() failed");
+    goto cleanup;
+  }
+
+  /* 3. Handle output tensors */
+  if (core->out_dmabuf.initialized) {
+    /* DMA-BUF output path: wrap delegate-owned fd as GstDmaBufMemory */
+    static GstAllocator *dmabuf_allocator = NULL;
+    if (G_UNLIKELY (!dmabuf_allocator))
+      dmabuf_allocator = gst_dmabuf_allocator_new ();
+
+    for (unsigned int i = 0; i < num_output; i++) {
+      GstMemory *out_mem = gst_dmabuf_allocator_alloc_with_flags (
+          dmabuf_allocator, core->out_dmabuf.fds[i],
+          core->out_dmabuf.sizes[i], GST_FD_MEMORY_FLAG_DONT_CLOSE);
+      if (G_UNLIKELY (!out_mem)) {
+        ml_loge ("tflite_invoke_v2: failed to wrap output DMA-BUF fd=%d",
+            core->out_dmabuf.fds[i]);
+        goto cleanup_output;
+      }
+      output[i] = out_mem;
+    }
+  } else {
+    /* CPU fallback: allocate system memory + memcpy (Phase 1 path) */
+    for (unsigned int i = 0; i < num_output; i++) {
+      TfLiteTensor *tensor = core->getOutputTensorPtr (i);
+      if (G_UNLIKELY (!tensor)) {
+        ml_loge ("tflite_invoke_v2: output tensor %u not cached", i);
+        goto cleanup_output;
+      }
+
+      GstMemory *out_mem = gst_allocator_alloc (NULL, tensor->bytes, NULL);
+      if (G_UNLIKELY (!out_mem)) {
+        ml_loge ("tflite_invoke_v2: failed to allocate output %u (%zu bytes)",
+            i, tensor->bytes);
+        goto cleanup_output;
+      }
+
+      GstMapInfo out_map;
+      if (!gst_memory_map (out_mem, &out_map, GST_MAP_WRITE)) {
+        gst_memory_unref (out_mem);
+        ml_loge ("tflite_invoke_v2: failed to map output memory %u", i);
+        goto cleanup_output;
+      }
+
+      memcpy (out_map.data, tensor->data.raw, tensor->bytes);
+      gst_memory_unmap (out_mem, &out_map);
+      output[i] = out_mem;
+    }
+  }
+
+  ret = 0;
+  goto cleanup;
+
+cleanup_output:
+  /* Free any output memories allocated so far on error */
+  for (unsigned int i = 0; i < num_output; i++) {
+    if (output[i]) {
+      gst_memory_unref ((GstMemory *) output[i]);
+      output[i] = NULL;
+    }
+  }
+
+cleanup:
+  /* Unmap CPU-mapped inputs and unregister DMA-BUF handles */
+  for (unsigned int i = 0; i < num_input; i++) {
+    if (in_mapped[i])
+      gst_memory_unmap ((GstMemory *) input[i], &in_maps[i]);
+    if (in_dmabuf[i] && in_handles[i] != kTfLiteNullBufferHandle)
+      vx_dmabuf_api.UnregisterDmaBuf (delegate, in_handles[i]);
+  }
+
+  return ret;
 }
 
 /**
@@ -1760,20 +2641,56 @@ tflite_checkAvailability (accl_hw hw)
   return -ENOENT;
 }
 
+/**
+ * @brief V2 propose_allocation callback for TFLite sub-plugin.
+ *
+ * Adds the delegate-owned input DMA-BUF pool to the allocation query so
+ * upstream elements (e.g., imxvideoconvert_g2d) can write directly into
+ * the pre-bound buffer.
+ */
+static int
+tflite_propose_allocation_v2 (const GstTensorFilterProperties *prop,
+    void **private_data, void *query_ptr)
+{
+  TFLiteCore *core = static_cast<TFLiteCore *> (*private_data);
+  GstQuery *query = (GstQuery *) query_ptr;
+  UNUSED (prop);
+
+  if (!core || !query || !core->isDmaBufEnabled ())
+    return 0;
+
+  /* Add delegate-owned input DMA-BUF pool if available */
+  if (core->in_dmabuf.initialized && core->in_dmabuf.pool) {
+    gst_query_add_allocation_pool (
+        query, core->in_dmabuf.pool, core->in_dmabuf.size, 1, 1);
+    nns_logi ("Proposed input DMA-BUF pool: fd=%d size=%zu",
+        core->in_dmabuf.fd, core->in_dmabuf.size);
+  }
+
+  /* Add DMA-BUF allocator to allocation params */
+  GstAllocator *dmabuf_alloc = gst_dmabuf_allocator_new ();
+  if (dmabuf_alloc) {
+    gst_query_add_allocation_param (query, dmabuf_alloc, NULL);
+    gst_object_unref (dmabuf_alloc);
+  }
+
+  return 0;
+}
+
 static gchar filter_subplugin_tensorflow_lite[] = TFLITE_SUBPLUGIN_NAME;
 
 static GstTensorFilterFramework NNS_support_tensorflow_lite
-    = { .version = GST_TENSOR_FILTER_FRAMEWORK_V0,
+    = { .version = GST_TENSOR_FILTER_FRAMEWORK_V2,
         .open = tflite_open,
         .close = tflite_close,
-        { .v0 = {
+        { .v2 = {
               .name = filter_subplugin_tensorflow_lite,
-              .allow_in_place = FALSE, /** @todo: support this to optimize performance later. */
-              .allocate_in_invoke = FALSE,
+              .allow_in_place = FALSE,
+              .allocate_in_invoke = TRUE, /**< V2: sub-plugin allocates output GstMemory* */
               .run_without_model = FALSE,
               .verify_model_path = TRUE,
               .statistics = &tflite_internal_stats,
-              .invoke_NN = tflite_invoke,
+              .invoke_v2 = tflite_invoke_v2,
               .getInputDimension = tflite_getInputDim,
               .getOutputDimension = tflite_getOutputDim,
               .setInputDimension = tflite_setInputDim,
@@ -1782,6 +2699,7 @@ static GstTensorFilterFramework NNS_support_tensorflow_lite
               .handleEvent = nullptr,
               .checkAvailability = tflite_checkAvailability,
               .allocateInInvoke = nullptr,
+              .propose_allocation = tflite_propose_allocation_v2,
           } } };
 
 /**
@@ -1791,7 +2709,7 @@ static void
 _nns_filter_register_tflite (void)
 {
   nnstreamer_filter_probe (&NNS_support_tensorflow_lite);
-  nnstreamer_filter_set_custom_property_desc (NNS_support_tensorflow_lite.v0.name,
+  nnstreamer_filter_set_custom_property_desc (NNS_support_tensorflow_lite.v2.name,
       "NumThreads", "Number of threads. Set 0 for default behaviors.",
       "UseDefaultDelegates", "Whether to use default delegates in resolver. Set 'true' or 'false'. Default is 'false'.",
       "Delegate", "TF-Lite delegation options: {'NNAPI', 'GPU', 'XNNPACK', 'External', 'QNN'}."
@@ -1813,5 +2731,5 @@ init_filter_tflite (void)
 void
 fini_filter_tflite (void)
 {
-  nnstreamer_filter_exit (NNS_support_tensorflow_lite.v0.name);
+  nnstreamer_filter_exit (NNS_support_tensorflow_lite.v2.name);
 }

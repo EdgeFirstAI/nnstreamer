@@ -148,6 +148,7 @@ gst_controller_dep = dependency('gstreamer-controller-' + gst_api_version)
 gst_video_dep = dependency('gstreamer-video-' + gst_api_version)
 gst_audio_dep = dependency('gstreamer-audio-' + gst_api_version)
 gst_app_dep = dependency('gstreamer-app-' + gst_api_version)
+gst_allocators_dep = dependency('gstreamer-allocators-' + gst_api_version)
 gst_check_dep = dependency('gstreamer-check-' + gst_api_version)
 
 libm_dep = cc.find_library('m') # cmath library

@@ -36,10 +36,11 @@
 #define GST_TENSOR_FILTER_FRAMEWORK_BASE (0xDEAFDEAD00000000ULL)
 #define GST_TENSOR_FILTER_FRAMEWORK_V0 (GST_TENSOR_FILTER_FRAMEWORK_BASE)
 #define GST_TENSOR_FILTER_FRAMEWORK_V1 (GST_TENSOR_FILTER_FRAMEWORK_BASE | 0x10000ULL)
+#define GST_TENSOR_FILTER_FRAMEWORK_V2 (GST_TENSOR_FILTER_FRAMEWORK_BASE | 0x20000ULL)
 
 #define GST_TENSOR_FILTER_API_VERSION_DEFINED (1)
 #define GST_TENSOR_FILTER_API_VERSION_MIN (0)	/* The minimum API version supported (could be obsolete) */
-#define GST_TENSOR_FILTER_API_VERSION_MAX (1)	/* The maximum API version supported (recommended) */
+#define GST_TENSOR_FILTER_API_VERSION_MAX (2)	/* The maximum API version supported (recommended) */
 
 /**
  * @brief Check the value of the version field of GstTensorFilterFramework
@@ -465,6 +466,108 @@ struct _GstTensorFilterFramework
         v1
 #endif
     ;
+
+    /**
+     * @brief Tensor_Filter Subplugin definition Version 2
+     *
+     * V2 extends V0 by passing opaque GstMemory* pointers directly instead
+     * of mapped GstTensorMemory, enabling sub-plugins to detect and handle
+     * DMA-BUF memory for zero-copy inference. The sub-plugin is responsible
+     * for casting input/output pointers to GstMemory* and handling them
+     * appropriately (map for CPU access, or extract DMA-BUF fd for hardware).
+     */
+    struct /** _GstTensorFilterFramework_v2 */
+    {
+      char *name; /**< Name of the neural network framework, searchable by FRAMEWORK property */
+      int allow_in_place; /**< TRUE(nonzero) if in-place transfer of input-to-output is allowed. Not supported in main, yet */
+      int allocate_in_invoke; /**< TRUE(nonzero) if invoke_v2 is going to allocate output GstMemory* by itself. */
+      int run_without_model; /**< TRUE(nonzero) when the neural network framework does not need a model file. */
+      int verify_model_path; /**< TRUE(nonzero) when the NNS framework, not the sub-plugin, should verify the path of model files. */
+
+      const GstTensorFilterFrameworkStatistics *statistics; /**< usage statistics by the framework. */
+
+      int (*invoke_v2) (const GstTensorFilterProperties * prop, void **private_data,
+          void ** input, void ** output,
+          unsigned int num_input, unsigned int num_output);
+      /**< Mandatory callback. Invoke the given network model with GstMemory* passthrough.
+       *
+       * Unlike V0/V1 which receives mapped GstTensorMemory (void *data, size_t size),
+       * V2 receives opaque GstMemory* pointers that have NOT been mapped by tensor_filter.
+       * The sub-plugin is responsible for:
+       *  - Casting input[i]/output[i] to GstMemory* (from <gst/gst.h>)
+       *  - Checking memory type (e.g., gst_is_dmabuf_memory() for DMA-BUF zero-copy)
+       *  - Mapping for CPU access if needed (gst_memory_map())
+       *  - Unmapping after use (gst_memory_unmap())
+       *
+       * If allocate_in_invoke is TRUE:
+       *  - output[i] starts as NULL
+       *  - Sub-plugin MUST set output[i] to a newly allocated GstMemory*
+       *  - tensor_filter takes ownership of the returned GstMemory*
+       *
+       * If allocate_in_invoke is FALSE:
+       *  - output[i] is pre-allocated by tensor_filter (system memory)
+       *  - Sub-plugin maps and fills the output data
+       *
+       * @param[in] prop read-only property values
+       * @param[in/out] private_data A subplugin may save its internal private data here.
+       * @param[in] input Array of opaque GstMemory* for input tensors (NOT mapped)
+       * @param[in/out] output Array of opaque GstMemory* for output tensors
+       * @param[in] num_input Number of input tensors
+       * @param[in] num_output Number of output tensors
+       * @return 0 if OK. non-zero if error.
+       */
+
+      int (*getInputDimension) (const GstTensorFilterProperties * prop,
+          void **private_data, GstTensorsInfo * info);
+      /**< Optional. Same as V0 getInputDimension. */
+
+      int (*getOutputDimension) (const GstTensorFilterProperties * prop,
+          void **private_data, GstTensorsInfo * info);
+      /**< Optional. Same as V0 getOutputDimension. */
+
+      int (*setInputDimension) (const GstTensorFilterProperties * prop,
+          void **private_data, const GstTensorsInfo * in_info,
+          GstTensorsInfo * out_info);
+      /**< Optional. Same as V0 setInputDimension. */
+
+      void (*destroyNotify) (void **private_data, void * data);
+      /**< Optional. Same as V0 destroyNotify. */
+
+      int (*reloadModel) (const GstTensorFilterProperties * prop, void **private_data);
+      /**< Optional. Same as V0 reloadModel. */
+
+      int (*handleEvent) (event_ops ops, GstTensorFilterFrameworkEventData * data);
+      /**< Optional. Same as V0 handleEvent. */
+
+      int (*checkAvailability) (accl_hw hw);
+      /**< Optional. Same as V0 checkAvailability. */
+
+      int (*allocateInInvoke) (void **private_data);
+      /**< Optional. Same as V0 allocateInInvoke. */
+
+      int (*propose_allocation) (const GstTensorFilterProperties * prop,
+          void **private_data, void * query);
+      /**< Optional. V2-only. Called during GstBaseTransform propose_allocation
+       * to let the sub-plugin add custom buffer pools or allocator params
+       * to the upstream allocation query. The query parameter is a GstQuery*
+       * (passed as void* to avoid GStreamer header dependency).
+       *
+       * @param[in] prop read-only property values
+       * @param[in/out] private_data sub-plugin private data
+       * @param[in] query GstQuery* allocation query (cast from void*)
+       * @return 0 if OK. non-zero if error (non-fatal, allocation query continues).
+       */
+    } v2;
+    /**< V2 is ALWAYS accessed as fw->v2.field (not anonymous) to avoid
+     * name conflicts with V0's anonymous members.
+     *
+     * For callbacks shared with V0 (getInputDimension, getOutputDimension,
+     * setInputDimension, etc.), tensor_filter_common uses gst_tensor_filter_v0_call()
+     * which accesses V0's anonymous members. This works because V2's layout
+     * mirrors V0's in the union (same offsets), so the union memory is shared.
+     *
+     * Only invoke_v2 (unique to V2) requires explicit fw->v2.invoke_v2 access.
+     */
   };
 };
 

@@ -192,7 +192,7 @@ if tflite2_support_is_available
 
   filter_sub_tflite2_sources = ['tensor_filter_tensorflow_lite.cc']
 
-  nnstreamer_filter_tflite2_deps = [tflite2_support_deps, thread_dep, libdl_dep, nnstreamer_single_dep]
+  nnstreamer_filter_tflite2_deps = [tflite2_support_deps, thread_dep, libdl_dep, gst_allocators_dep, nnstreamer_single_dep]
 
   tflite2_compile_args = []
   tflite2_compile_args += '-DTFLITE_INT8=1'

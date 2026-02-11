@@ -45,6 +45,7 @@ G_BEGIN_DECLS
     (fw && checkGstTensorFilterFrameworkVersion (fw->version, vn))
 #define GST_TF_FW_V0(fw) GST_TF_FW_VN (fw, 0)
 #define GST_TF_FW_V1(fw) GST_TF_FW_VN (fw, 1)
+#define GST_TF_FW_V2(fw) GST_TF_FW_VN (fw, 2)
 
 /**
  * @brief Invoke callbacks of nn framework. Guarantees calling open for the first call.
