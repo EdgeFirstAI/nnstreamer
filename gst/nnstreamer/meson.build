@@ -5,7 +5,8 @@ nnstreamer_headers = []
 nnstreamer_single_deps = [
   glib_dep,
   gmodule_dep,
-  gobject_dep
+  gobject_dep,
+  zlib_dep
 ]
 
 # log utils
@@ -45,7 +46,8 @@ nnstreamer_single_sources = [
   'nnstreamer_conf.c',
   'nnstreamer_log.c',
   'nnstreamer_subplugin.c',
-  'nnstreamer_plugin_api_util_impl.c'
+  'nnstreamer_plugin_api_util_impl.c',
+  'nnstreamer_tensor_quant_info.c'
 ]
 
 if ml_agent_support_is_available
@@ -59,7 +61,8 @@ nnstreamer_sources = [
   'nnstreamer_plugin_api_impl.c',
   'tensor_allocator.c',
   'tensor_data.c',
-  'tensor_meta.c'
+  'tensor_meta.c',
+  'nnstreamer_tensor_quant_meta.c'
 ]
 
 # Add plugins

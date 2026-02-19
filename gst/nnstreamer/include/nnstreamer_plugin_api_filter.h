@@ -557,6 +557,48 @@ struct _GstTensorFilterFramework
        * @param[in] query GstQuery* allocation query (cast from void*)
        * @return 0 if OK. non-zero if error (non-fatal, allocation query continues).
        */
+
+      const char *(*get_model_metadata) (const GstTensorFilterProperties * prop,
+          void **private_data);
+      /**< Optional. V2-only. Returns model metadata as a JSON string
+       * conforming to the EdgeFirst metadata schema. The returned string
+       * is owned by the sub-plugin and remains valid until close() is called.
+       * Returns NULL if not supported.
+       *
+       * @param[in] prop read-only property values
+       * @param[in/out] private_data sub-plugin private data
+       * @return JSON string or NULL
+       */
+
+      const char * const *(*get_model_labels) (
+          const GstTensorFilterProperties * prop,
+          void **private_data, unsigned int *num_labels);
+      /**< Optional. V2-only. Returns model class labels as a NULL-terminated
+       * string array in class-index order. The array and strings are owned
+       * by the sub-plugin and remain valid until close() is called.
+       * Sets *num_labels to the label count. Returns NULL if not available.
+       *
+       * @param[in] prop read-only property values
+       * @param[in/out] private_data sub-plugin private data
+       * @param[out] num_labels number of labels in the returned array
+       * @return NULL-terminated string array or NULL
+       */
+
+      int (*get_output_quantization) (const GstTensorFilterProperties * prop,
+          void **private_data, void *quant, unsigned int num_outputs);
+      /**< Optional. V2-only. Fill output tensor quantization parameters.
+       * The quant parameter is a NnsTensorQuantInfo* array (cast from void*
+       * to avoid nnstreamer_tensor_quant_meta.h dependency in this header).
+       * Fill quant[0..num_outputs-1] with each output tensor's quantization.
+       * Use nns_tensor_quant_info_set_affine/symmetric/per_channel helpers.
+       * Framework calls once after open and caches the result.
+       *
+       * @param[in] prop read-only property values
+       * @param[in/out] private_data sub-plugin private data
+       * @param[out] quant NnsTensorQuantInfo array[num_outputs] to populate
+       * @param[in] num_outputs number of output tensors
+       * @return 0 on success, non-zero on failure or not supported
+       */
     } v2;
     /**< V2 is ALWAYS accessed as fw->v2.field (not anonymous) to avoid
      * name conflicts with V0's anonymous members.

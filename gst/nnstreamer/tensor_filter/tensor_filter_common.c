@@ -29,6 +29,7 @@
 #include <ml_agent.h>
 #include <nnstreamer_log.h>
 #include <nnstreamer_util.h>
+#include <edgefirst_metadata.h>
 
 #include "tensor_filter_common.h"
 
@@ -1050,6 +1051,14 @@ gst_tensor_filter_install_properties (GObjectClass * gobject_class)
       g_param_spec_string ("config-file", "Configuration-file",
           "Path to configuration file which contains plugins properties", "",
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (gobject_class, PROP_MODEL_METADATA,
+      g_param_spec_string ("model-metadata", "Model Metadata",
+          "Sub-plugin model metadata as JSON (read-only, available after model load)",
+          NULL, G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
+  g_object_class_install_property (gobject_class, PROP_MODEL_LABELS,
+      g_param_spec_boxed ("model-labels", "Model Labels",
+          "Ordered class labels from model file (read-only, available after model load)",
+          G_TYPE_STRV, G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
 }
 
 /**
@@ -2256,6 +2265,35 @@ gst_tensor_filter_common_get_property (GstTensorFilterPrivate * priv,
     case PROP_INVOKE_DYNAMIC:
       g_value_set_boolean (value, prop->invoke_dynamic);
       break;
+    case PROP_MODEL_METADATA:
+    {
+      const char *json = NULL;
+      /* ZIP-embedded metadata first (framework-level) */
+      json = priv->cached_metadata_json;
+      /* V2 sub-plugin fallback (model-specific, e.g., dv_model_t) */
+      if (!json && priv->fw && GST_TF_FW_V2 (priv->fw)
+          && priv->fw->v2.get_model_metadata)
+        json = priv->fw->v2.get_model_metadata (&priv->prop,
+            &priv->privateData);
+      g_value_set_string (value, json);
+      break;
+    }
+    case PROP_MODEL_LABELS:
+    {
+      const char * const *labels = NULL;
+      /* ZIP-embedded labels first (framework-level) */
+      if (priv->cached_labels)
+        labels = (const char * const *) priv->cached_labels;
+      /* V2 sub-plugin fallback */
+      if (!labels && priv->fw && GST_TF_FW_V2 (priv->fw)
+          && priv->fw->v2.get_model_labels) {
+        unsigned int num = 0;
+        labels = priv->fw->v2.get_model_labels (&priv->prop,
+            &priv->privateData, &num);
+      }
+      g_value_set_boxed (value, labels);
+      break;
+    }
     default:
       /* unknown property */
       return FALSE;
@@ -2481,6 +2519,19 @@ gst_tensor_filter_load_tensor_info (GstTensorFilterPrivate * priv)
     silent_debug_info (&out_info, "output tensor");
   }
 
+  /* Query output quantization once output dimensions are known.
+   * Must be after output_meta.num_tensors is populated by getOutputDimension. */
+  if (prop->output_configured && !priv->has_output_quant
+      && GST_TF_FW_V2 (priv->fw)
+      && priv->fw->v2.get_output_quantization) {
+    guint n = prop->output_meta.num_tensors;
+    if (n > 0 && priv->fw->v2.get_output_quantization (prop,
+        &priv->privateData, priv->cached_output_quant, n) == 0) {
+      priv->cached_output_quant_count = n;
+      priv->has_output_quant = TRUE;
+    }
+  }
+
 done:
   gst_tensors_info_free (&in_info);
   gst_tensors_info_free (&out_info);
@@ -2529,6 +2580,15 @@ gst_tensor_filter_common_open_fw (GstTensorFilterPrivate * priv)
       }
     }
 
+    /* Read ZIP-embedded metadata from model file */
+    if (priv->prop.fw_opened && priv->prop.model_files
+        && priv->prop.model_files[0]) {
+      priv->cached_metadata_json = edgefirst_zip_read_metadata_c (
+          priv->prop.model_files[0]);
+      priv->cached_labels = edgefirst_zip_read_labels_c (
+          priv->prop.model_files[0], &priv->cached_num_labels);
+    }
+
     end_time = g_get_monotonic_time ();
     if (priv->prop.fw_opened == TRUE &&
         priv->prop.fwname && priv->prop.model_files) {
@@ -2546,6 +2606,22 @@ void
 gst_tensor_filter_common_close_fw (GstTensorFilterPrivate * priv)
 {
   if (priv->prop.fw_opened) {
+    /* Free cached ZIP metadata before closing framework */
+    g_free (priv->cached_metadata_json);
+    priv->cached_metadata_json = NULL;
+    g_strfreev (priv->cached_labels);
+    priv->cached_labels = NULL;
+    priv->cached_num_labels = 0;
+
+    /* Free cached output quantization */
+    if (priv->has_output_quant) {
+      guint qi;
+      for (qi = 0; qi < priv->cached_output_quant_count; qi++)
+        nns_tensor_quant_info_clear (&priv->cached_output_quant[qi]);
+      priv->cached_output_quant_count = 0;
+      priv->has_output_quant = FALSE;
+    }
+
     if (priv->fw && priv->fw->close) {
       priv->fw->close (&priv->prop, &priv->privateData);
     }

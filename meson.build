@@ -435,6 +435,9 @@ if not get_option('ncnn-support').disabled()
   endif
 endif
 
+# zlib — used by edgefirst metadata parser (ZIP archive in model files)
+zlib_dep = dependency('zlib', required: false)
+
 # datarepo requires json-glib-1.0 in the name of json_glib_dep
 json_glib_dep = dependency('json-glib-1.0', required: false)
 if get_option('datarepo-support').enabled() and not json_glib_dep.found()

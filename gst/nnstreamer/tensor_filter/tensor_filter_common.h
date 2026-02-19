@@ -30,6 +30,7 @@
 #include <nnstreamer_subplugin.h>
 #include <nnstreamer_plugin_api_util.h>
 #include <nnstreamer_plugin_api_filter.h>
+#include <nnstreamer_tensor_quant_meta.h>
 
 G_BEGIN_DECLS
 
@@ -107,7 +108,9 @@ enum
   PROP_SHARED_TENSOR_FILTER_KEY,
   PROP_LATENCY_REPORT,
   PROP_INVOKE_DYNAMIC,
-  PROP_CONFIG
+  PROP_CONFIG,
+  PROP_MODEL_METADATA,
+  PROP_MODEL_LABELS
 };
 
 /**
@@ -170,6 +173,16 @@ typedef struct _GstTensorFilterPrivate
   gint64 latency_reported; /**< latency value reported (ns) in last LATENCY query */
 
   GstTensorFilterCombination combi;
+
+  /* Cached ZIP-embedded model metadata (populated at open, freed at close) */
+  gchar *cached_metadata_json;   /**< edgefirst.json from model ZIP, or NULL */
+  GStrv cached_labels;           /**< Labels from model ZIP, or NULL */
+  unsigned int cached_num_labels; /**< Number of cached labels */
+
+  /* Cached output quantization params (populated at open from V2 callback) */
+  NnsTensorQuantInfo cached_output_quant[NNS_TENSOR_SIZE_LIMIT];
+  guint cached_output_quant_count; /**< number of valid entries */
+  gboolean has_output_quant;       /**< TRUE if sub-plugin provided quant params */
 } GstTensorFilterPrivate;
 
 /**

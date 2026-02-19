@@ -931,9 +931,15 @@ else
 endif
 
 if ara2_available
-  shared_library('nnstreamer_filter_ara2',
+  nnstreamer_filter_ara2_sources = [
     'tensor_filter_ara2.cc',
-    dependencies: [glib_dep, gst_allocators_dep, libdl_dep, nnstreamer_single_dep],
+  ]
+  nnstreamer_filter_ara2_deps = [
+    glib_dep, gst_allocators_dep, libdl_dep, nnstreamer_single_dep,
+  ]
+  shared_library('nnstreamer_filter_ara2',
+    nnstreamer_filter_ara2_sources,
+    dependencies: nnstreamer_filter_ara2_deps,
     install: true,
     install_dir: filter_subplugin_install_dir
   )

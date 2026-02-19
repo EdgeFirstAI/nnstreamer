@@ -12,7 +12,8 @@ nnstreamer_headers += files(
   'nnstreamer_plugin_api_converter.h',
   'nnstreamer_plugin_api_util.h',
   'nnstreamer_plugin_api.h',
-  'nnstreamer_util.h'
+  'nnstreamer_util.h',
+  'nnstreamer_tensor_quant_meta.h'
 )
 
 if get_option('enable-filter-cpp-class')

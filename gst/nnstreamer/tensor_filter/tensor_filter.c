@@ -644,6 +644,38 @@ _gst_tensor_filter_transform_validate (GstBaseTransform * trans,
 }
 
 /**
+ * @brief Attach cached quantization metadata to the output buffer.
+ *
+ * Deep-copies the cached NnsTensorQuantInfo array into a new
+ * GstNnsTensorQuantMeta on the output buffer. Called from both
+ * V0 and V2 transform paths after producing the output.
+ */
+static void
+gst_tensor_filter_attach_quant_meta (GstTensorFilterPrivate * priv,
+    GstBuffer * outbuf)
+{
+  GstNnsTensorQuantMeta *qmeta;
+  guint qi;
+
+  if (!priv->has_output_quant)
+    return;
+
+  qmeta = gst_buffer_add_nns_tensor_quant_meta (outbuf);
+  if (!qmeta)
+    return;
+
+  qmeta->num_tensors = priv->cached_output_quant_count;
+  for (qi = 0; qi < qmeta->num_tensors; qi++) {
+    NnsTensorQuantInfo *cached = &priv->cached_output_quant[qi];
+    if (cached->scheme == NNS_QUANT_NONE || cached->num_params == 0)
+      continue;
+    nns_tensor_quant_info_set_per_channel (&qmeta->quant[qi],
+        cached->scheme, cached->dtype, cached->num_params,
+        cached->axis, cached->scales, cached->zero_points);
+  }
+}
+
+/**
  * @brief V2 transform path — passes GstMemory* directly without mapping.
  *
  * Unlike V0/V1 which maps every GstMemory to get (void *data, size_t size),
@@ -824,6 +856,9 @@ gst_tensor_filter_transform_v2 (GstBaseTransform * trans,
     if (in_mem[i])
       gst_memory_unref (in_mem[i]);
   }
+
+  /* 7. Attach quantization metadata to output buffer */
+  gst_tensor_filter_attach_quant_meta (priv, outbuf);
 
   return GST_FLOW_OK;
 
@@ -1136,6 +1171,9 @@ gst_tensor_filter_transform (GstBaseTransform * trans,
     gst_tensor_buffer_append_memory (outbuf, out_mem[i],
         gst_tensors_info_get_nth_info (&prop->output_meta, i));
   }
+
+  /* Attach quantization metadata to output buffer */
+  gst_tensor_filter_attach_quant_meta (priv, outbuf);
 
   return GST_FLOW_OK;
 

@@ -62,9 +62,12 @@
 #include <nnstreamer_plugin_api_filter.h>
 #undef NO_ANONYMOUS_NESTED_STRUCT
 #include <nnstreamer_conf.h>
+#include <nnstreamer_tensor_quant_meta.h>
 #include <nnstreamer_util.h>
 
 #include <dvapi.h>
+
+/* edgefirst_metadata.h no longer needed — ZIP reading moved to framework */
 
 /**
  * @brief Macro for debug mode.
@@ -312,6 +315,8 @@ class Ara2Core
   int proposeAllocation (GstQuery *query);
 
   gboolean isDmaBufEnabled () const { return dmabuf_enabled_; }
+
+  int get_output_quantization (NnsTensorQuantInfo *quant, unsigned int num_outputs);
 
   private:
   /* Session / model lifecycle */
@@ -825,7 +830,7 @@ Ara2Core::open (const GstTensorFilterProperties *prop)
     return -EINVAL;
   }
 
-  /* 6b. Log the model's native input format.
+  /* 6a. Log the model's native input format.
    * The sub-plugin no longer performs any preprocessing — upstream must
    * deliver data in the model's native format (e.g. int8 CHW) via
    * edgefirstcameraadaptor or a tensor_transform chain. */
@@ -898,6 +903,35 @@ Ara2Core::close ()
     ::close (dma_heap_fd_);
     dma_heap_fd_ = -1;
   }
+}
+
+/**
+ * @brief Fill output tensor quantization parameters from dv_model_t.
+ */
+int
+Ara2Core::get_output_quantization (NnsTensorQuantInfo *quant,
+    unsigned int num_outputs)
+{
+  if (!model_)
+    return -1;
+
+  for (unsigned int i = 0; i < num_outputs
+      && i < (unsigned int) model_->num_outputs; i++) {
+    dv_model_output_param_t *p = &model_->output_param[i];
+    if (p->postprocess_param && p->postprocess_param->qn != 0.0f) {
+      tensor_type dtype = bppToTensorType (p->bpp,
+          p->postprocess_param->is_signed, p->postprocess_param->is_float);
+      if (p->postprocess_param->offset == 0)
+        nns_tensor_quant_info_set_symmetric (&quant[i], dtype,
+            (gdouble) p->postprocess_param->qn);
+      else
+        nns_tensor_quant_info_set_affine (&quant[i], dtype,
+            (gdouble) p->postprocess_param->qn,
+            (gint64) p->postprocess_param->offset);
+    }
+  }
+
+  return 0;
 }
 
 /**
@@ -1275,6 +1309,23 @@ ara2_checkAvailability (accl_hw hw)
   return -ENOENT;
 }
 
+/**
+ * @brief V2 get_output_quantization callback.
+ */
+static int
+ara2_get_output_quantization (const GstTensorFilterProperties *prop,
+    void **private_data, void *quant_ptr, unsigned int num_outputs)
+{
+  Ara2Core *core = static_cast<Ara2Core *> (*private_data);
+  NnsTensorQuantInfo *quant = static_cast<NnsTensorQuantInfo *> (quant_ptr);
+  UNUSED (prop);
+
+  if (!core)
+    return -1;
+
+  return core->get_output_quantization (quant, num_outputs);
+}
+
 static GstTensorFilterFramework NNS_support_ara2
     = { .version = GST_TENSOR_FILTER_FRAMEWORK_V2,
         .open = ara2_open,
@@ -1296,6 +1347,9 @@ static GstTensorFilterFramework NNS_support_ara2
               .checkAvailability = ara2_checkAvailability,
               .allocateInInvoke = nullptr,
               .propose_allocation = ara2_propose_allocation_v2,
+              .get_model_metadata = NULL,
+              .get_model_labels = NULL,   /* ZIP labels handled by framework */
+              .get_output_quantization = ara2_get_output_quantization,
           } } };
 
 /**

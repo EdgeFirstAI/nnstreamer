@@ -44,6 +44,7 @@
 #undef NO_ANONYMOUS_NESTED_STRUCT
 #include <nnstreamer_conf.h>
 #include <nnstreamer_util.h>
+#include <nnstreamer_tensor_quant_meta.h>
 
 #if TFLITE_VERSION_MAJOR < 2
 #pragma message("tensor_filter of TensorFlow Lite version 1.X is deprecated. Please use of TF Lite 2.X")
@@ -2677,6 +2678,103 @@ tflite_propose_allocation_v2 (const GstTensorFilterProperties *prop,
   return 0;
 }
 
+/**
+ * @brief Map TfLiteType to NNStreamer tensor_type (standalone helper).
+ */
+static tensor_type
+tflite_map_type (TfLiteType t)
+{
+  switch (t) {
+    case kTfLiteFloat32: return _NNS_FLOAT32;
+    case kTfLiteUInt8:   return _NNS_UINT8;
+    case kTfLiteInt32:   return _NNS_INT32;
+    case kTfLiteInt64:   return _NNS_INT64;
+#ifdef TFLITE_INT8
+    case kTfLiteInt8:    return _NNS_INT8;
+#endif
+#ifdef TFLITE_INT16
+    case kTfLiteInt16:   return _NNS_INT16;
+#endif
+#if defined(TFLITE_FLOAT16) && defined(FLOAT16_SUPPORT)
+    case kTfLiteFloat16: return _NNS_FLOAT16;
+#endif
+    default:             return _NNS_END;
+  }
+}
+
+/**
+ * @brief V2 get_output_quantization callback.
+ *
+ * Reads quantization parameters from TfLiteTensor for each output.
+ * Supports both per-tensor and per-channel (per-axis) quantization.
+ */
+static int
+tflite_get_output_quantization (const GstTensorFilterProperties *prop,
+    void **private_data, void *quant_ptr, unsigned int num_outputs)
+{
+  TFLiteCore *core = static_cast<TFLiteCore *> (*private_data);
+  NnsTensorQuantInfo *quant = static_cast<NnsTensorQuantInfo *> (quant_ptr);
+  UNUSED (prop);
+
+  if (!core)
+    return -1;
+
+  tflite::Interpreter *tfl = core->getTfLiteInterpreter ();
+  if (!tfl)
+    return -1;
+
+  const std::vector<int> &outputs = tfl->outputs ();
+  for (unsigned int i = 0; i < num_outputs && i < outputs.size (); i++) {
+    TfLiteTensor *t = tfl->tensor (outputs[i]);
+    if (!t)
+      continue;
+
+    tensor_type dtype = tflite_map_type (t->type);
+
+    /* Check for per-channel (per-axis) quantization */
+    if (t->quantization.type == kTfLiteAffineQuantization
+        && t->quantization.params) {
+      TfLiteAffineQuantization *aq =
+          static_cast<TfLiteAffineQuantization *> (t->quantization.params);
+
+      if (aq->scale && aq->scale->size > 1) {
+        /* Per-channel quantization */
+        gdouble *scales = (gdouble *) g_new (gdouble, aq->scale->size);
+        gint64 *zps = (gint64 *) g_new (gint64, aq->scale->size);
+        gboolean is_symmetric = TRUE;
+
+        for (int j = 0; j < aq->scale->size; j++) {
+          scales[j] = aq->scale->data[j];
+          zps[j] = (aq->zero_point && j < aq->zero_point->size)
+              ? aq->zero_point->data[j] : 0;
+          if (zps[j] != 0)
+            is_symmetric = FALSE;
+        }
+
+        NnsTensorQuantScheme scheme = is_symmetric
+            ? NNS_QUANT_SYMMETRIC_PER_CHANNEL : NNS_QUANT_AFFINE_PER_CHANNEL;
+        nns_tensor_quant_info_set_per_channel (&quant[i], scheme, dtype,
+            aq->scale->size, aq->quantized_dimension, scales, zps);
+        g_free (scales);
+        g_free (zps);
+        continue;
+      }
+    }
+
+    /* Per-tensor quantization (common case for output activations) */
+    if (t->params.scale != 0.0f) {
+      if (t->params.zero_point == 0)
+        nns_tensor_quant_info_set_symmetric (&quant[i], dtype,
+            (gdouble) t->params.scale);
+      else
+        nns_tensor_quant_info_set_affine (&quant[i], dtype,
+            (gdouble) t->params.scale, (gint64) t->params.zero_point);
+    }
+  }
+
+  return 0;
+}
+
 static gchar filter_subplugin_tensorflow_lite[] = TFLITE_SUBPLUGIN_NAME;
 
 static GstTensorFilterFramework NNS_support_tensorflow_lite
@@ -2700,6 +2798,9 @@ static GstTensorFilterFramework NNS_support_tensorflow_lite
               .checkAvailability = tflite_checkAvailability,
               .allocateInInvoke = nullptr,
               .propose_allocation = tflite_propose_allocation_v2,
+              .get_model_metadata = NULL,
+              .get_model_labels = NULL,
+              .get_output_quantization = tflite_get_output_quantization,
           } } };
 
 /**

@@ -1,3 +1,51 @@
+edgefirst (based on 2.4.2)
+	- EdgeFirst fork for NXP i.MX platforms with DMA-BUF zero-copy inference.
+
+	- V2 Invoke Framework
+		- New tensor_filter sub-plugin API version (V2) that passes GstMemory* directly to invoke, enabling zero-copy DMA-BUF paths for NPU inference.
+		- V2 invoke_v2 callback receives opaque GstMemory* pointers instead of mapped (void*, size) pairs, allowing sub-plugins to detect DMA-BUF memory and avoid CPU mapping.
+		- V2 struct shares union memory layout with V0 for backward compatibility; shared callbacks (getInputDimension, getOutputDimension, etc.) work transparently via gst_tensor_filter_v0_call.
+		- propose_allocation callback allows V2 sub-plugins to add custom buffer pools to GStreamer's allocation negotiation.
+
+	- DMA-BUF Zero-Copy
+		- Output DMA-BUF allocation: tensor_filter advertises DMA-BUF memory downstream via propose_allocation.
+		- Delegate-owned input DMA-BUF: NPU delegates allocate input buffers that upstream elements (e.g. G2D hardware video converter) can write into directly.
+		- NnsDmaBufInputPool: GstBufferPool subclass wrapping delegate-owned DMA-BUF file descriptors for upstream allocation.
+		- Allocation proxy: tensor_converter forwards allocation queries so hardware video converters see the NPU's buffer pool.
+
+	- Tensor Quantization GstMeta
+		- GstNnsTensorQuantMeta: new GstMeta type attached to output buffers carrying per-tensor quantization parameters (scale, zero_point, scheme).
+		- Supports affine and symmetric quantization, per-tensor and per-channel granularity.
+		- V2 get_output_quantization callback queried once after model open; results cached and attached to every output buffer.
+		- TFLite sub-plugin reads from TfLiteTensor params (per-tensor) and TfLiteAffineQuantization (per-channel).
+		- Ara-2 sub-plugin reads from dv_model_output_param_t postprocess parameters.
+		- Library split: NnsTensorQuantInfo helpers in libnnstreamer-single (no GStreamer dependency), GstMeta registration in libnnstreamer.
+
+	- Model Metadata Properties
+		- model-metadata: read-only GObject property returning verbatim edgefirst.json from the model's embedded ZIP archive, or NULL.
+		- model-labels: read-only GObject property returning labels.txt from the model's embedded ZIP archive as GStrv, or NULL.
+		- Framework-level ZIP reader (edgefirst_metadata.cc) with seek-based I/O — reads only EOCD tail, central directory, and target entries without loading the model binary.
+		- Supports stored and deflated ZIP entries via zlib.
+
+	- TFLite Sub-Plugin (V2)
+		- V2 invoke path with DMA-BUF output allocation and delegate-owned input DMA-BUF.
+		- VxDelegate DMA-BUF API integration via dlsym (6 output symbols + VxDelegateGetInstance).
+		- CameraAdaptor support for 4-channel RGBA input from hardware video converters.
+		- Output quantization callback with per-tensor and per-channel support.
+
+	- Ara-2 NPU Sub-Plugin (new)
+		- V2 tensor_filter sub-plugin for Kinara Ara-2 NPU with full DMA-BUF zero-copy.
+		- All runtime symbols loaded via dlopen/dlsym; degrades gracefully when Ara-2 runtime is unavailable.
+		- NEON SIMD input preprocessing: combined RGBA-to-planar-RGB and uint8-to-int8 quantization in a single pass.
+		- Two-pool architecture: separate DMA-BUF pools for HAL preprocessing input and model input.
+		- Output quantization callback reading from dv_model_output_param_t.
+		- Build option: -Dara2-support=enabled (auto-detected from dvapi.h availability).
+
+	- Build System
+		- gst_allocators_dep added for DMA-BUF allocator support in libnnstreamer and TFLite sub-plugin.
+		- zlib_dep added to libnnstreamer-single for ZIP archive reading.
+		- Ara-2 sub-plugin conditionally built when EdgeFirst HAL headers are available.
+
 2.2.0 -> 2.3.0
         - 2.3.0 is a devel version for 2.4.0 release. Unstable and experimental features are welcomed in this version.
 

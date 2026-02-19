@@ -2,7 +2,8 @@ nnstreamer_single_sources += files(
   'tensor_filter_single.c',
   'tensor_filter_common.c',
   'tensor_filter_custom.c',
-  'tensor_filter_custom_easy.c'
+  'tensor_filter_custom_easy.c',
+  '../edgefirst_metadata.cc'
 )
 
 nnstreamer_headers += files('tensor_filter_single.h')
