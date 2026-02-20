@@ -83,6 +83,10 @@ _quant_meta_transform (GstBuffer * dest, GstMeta * meta,
 
 /**
  * @brief Register the GstMeta API type.
+ *
+ * This code may exist in both libnnstreamer.so (non-plugin) and the GStreamer
+ * plugin libnnstreamer.so, each with its own static variable. To avoid a
+ * double-registration GType collision, check g_type_from_name() first.
  */
 GType
 gst_nns_tensor_quant_meta_api_get_type (void)
@@ -91,8 +95,9 @@ gst_nns_tensor_quant_meta_api_get_type (void)
   static const gchar *tags[] = { NULL };
 
   if (g_once_init_enter (&type)) {
-    GType _type = gst_meta_api_type_register (
-        "GstNnsTensorQuantMetaAPI", tags);
+    GType _type = g_type_from_name ("GstNnsTensorQuantMetaAPI");
+    if (_type == 0)
+      _type = gst_meta_api_type_register ("GstNnsTensorQuantMetaAPI", tags);
     g_once_init_leave (&type, _type);
   }
 
