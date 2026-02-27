@@ -718,6 +718,18 @@ gst_tensor_filter_transform_v2 (GstBaseTransform * trans,
   allocate_in_invoke = gst_tensor_filter_allocate_in_invoke (priv);
   num_in_bufs = gst_tensor_buffer_get_count (inbuf);
 
+  if (in_flexible && num_in_bufs > prop->input_meta.num_tensors) {
+    /* tensor_transform chains can accumulate extra memory blocks in the
+     * GstBuffer (e.g. leftover pre-transform data with flexible headers).
+     * Use only the first num_tensors blocks — they contain the final
+     * transformed tensor data the model expects. */
+    ml_logd ("tensor_filter V2 (%s:%s): flexible buffer has %u memory blocks, "
+        "model expects %u — using first %u",
+        prop->fwname, TF_MODELNAME (prop), num_in_bufs,
+        prop->input_meta.num_tensors, prop->input_meta.num_tensors);
+    num_in_bufs = prop->input_meta.num_tensors;
+  }
+
   /* 1. Get input GstMemory* from inbuf */
   for (i = 0; i < num_in_bufs; i++) {
     in_mem[i] = gst_tensor_buffer_get_nth_memory (inbuf, i);
@@ -741,31 +753,40 @@ gst_tensor_filter_transform_v2 (GstBaseTransform * trans,
       }
       flex_mapped[i] = TRUE;
 
-      /* Parse the 128-byte flexible tensor header */
-      if (!gst_tensor_meta_info_parse_header (&meta, flex_maps[i].data)) {
-        ml_loge_stacktrace
-            ("gst_tensor_filter_transform_v2: failed to parse flexible header for %u'th tensor (%s : %s)\n",
-            i, prop->fwname, TF_MODELNAME (prop));
-        goto error_cleanup;
-      }
-      hsize = gst_tensor_meta_info_get_header_size (&meta);
-      mem_size = gst_memory_get_sizes (in_mem[i], NULL, NULL);
-
-      if (G_UNLIKELY (hsize >= mem_size)) {
-        ml_loge_stacktrace
-            ("gst_tensor_filter_transform_v2: flexible header size (%zu) >= memory size (%zu) for %u'th tensor (%s : %s)\n",
-            hsize, mem_size, i, prop->fwname, TF_MODELNAME (prop));
-        goto error_cleanup;
+      /* Try to parse the 128-byte flexible tensor header.
+       * Note: caps may be negotiated as flexible even when buffers contain
+       * raw tensor data without headers (e.g. tensor_transform output).
+       * V1 handles this by ignoring parse_header failure (hsize becomes 0).
+       * We follow the same pattern: if no valid header, pass memory as-is. */
+      hsize = 0;
+      if (gst_tensor_meta_info_parse_header (&meta, flex_maps[i].data)) {
+        hsize = gst_tensor_meta_info_get_header_size (&meta);
       }
 
-      /* Create a sub-memory that skips the header — points to raw tensor data */
-      stripped_mem[i] = gst_memory_share (in_mem[i], hsize, mem_size - hsize);
-      if (G_UNLIKELY (!stripped_mem[i])) {
-        ml_loge_stacktrace
-            ("gst_tensor_filter_transform_v2: cannot create sub-memory for %u'th tensor (%s : %s)\n",
-            i, prop->fwname, TF_MODELNAME (prop));
-        goto error_cleanup;
+      /* Unmap — we only needed the map to check the header */
+      gst_memory_unmap (in_mem[i], &flex_maps[i]);
+      flex_mapped[i] = FALSE;
+
+      if (hsize > 0) {
+        mem_size = gst_memory_get_sizes (in_mem[i], NULL, NULL);
+
+        if (G_UNLIKELY (hsize >= mem_size)) {
+          ml_loge_stacktrace
+              ("gst_tensor_filter_transform_v2: flexible header size (%zu) >= memory size (%zu) for %u'th tensor (%s : %s)\n",
+              hsize, mem_size, i, prop->fwname, TF_MODELNAME (prop));
+          goto error_cleanup;
+        }
+
+        /* Create a sub-memory that skips the header — points to raw tensor data */
+        stripped_mem[i] = gst_memory_share (in_mem[i], hsize, mem_size - hsize);
+        if (G_UNLIKELY (!stripped_mem[i])) {
+          ml_loge_stacktrace
+              ("gst_tensor_filter_transform_v2: cannot create sub-memory for %u'th tensor (%s : %s)\n",
+              i, prop->fwname, TF_MODELNAME (prop));
+          goto error_cleanup;
+        }
       }
+      /* else: no valid header — memory contains raw tensor data, use in_mem as-is */
     }
   }
 
@@ -793,7 +814,7 @@ gst_tensor_filter_transform_v2 (GstBaseTransform * trans,
             i, num_in_bufs, prop->fwname, TF_MODELNAME (prop));
         goto error_cleanup;
       }
-      invoke_in[num_invoke_in++] = in_flexible ? stripped_mem[i] : in_mem[i];
+      invoke_in[num_invoke_in++] = stripped_mem[i] ? stripped_mem[i] : in_mem[i];
     }
   } else {
     if (G_UNLIKELY (num_in_bufs != prop->input_meta.num_tensors)) {
@@ -811,7 +832,7 @@ gst_tensor_filter_transform_v2 (GstBaseTransform * trans,
       goto error_cleanup;
     }
     for (i = 0; i < num_in_bufs; i++)
-      invoke_in[i] = in_flexible ? stripped_mem[i] : in_mem[i];
+      invoke_in[i] = stripped_mem[i] ? stripped_mem[i] : in_mem[i];
     num_invoke_in = num_in_bufs;
   }
 
@@ -884,9 +905,9 @@ gst_tensor_filter_transform_v2 (GstBaseTransform * trans,
     for (list = priv->combi.out_combi_i; list != NULL; list = list->next) {
       GstMemory *pass_mem;
       i = GPOINTER_TO_UINT (list->data);
-      /* Use stripped (header-free) memory for flexible input, raw memory otherwise.
+      /* Use stripped (header-free) memory if available, raw memory otherwise.
        * Ref before append — append takes ownership, and we still unref below. */
-      pass_mem = (in_flexible && stripped_mem[i]) ? stripped_mem[i] : in_mem[i];
+      pass_mem = stripped_mem[i] ? stripped_mem[i] : in_mem[i];
       gst_tensor_buffer_append_memory (outbuf, gst_memory_ref (pass_mem),
           gst_tensors_info_get_nth_info (&priv->in_config.info, i));
     }
