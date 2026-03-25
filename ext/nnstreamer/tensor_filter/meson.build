@@ -247,6 +247,14 @@ if tflite2_support_is_available
   tflite2_custom_compile_args = tflite2_compile_args
   tflite2_compile_args += '-DTFLITE_SUBPLUGIN_NAME="tensorflow2-lite"'
 
+  # EdgeFirst HAL delegate DMA-BUF support (optional)
+  edgefirst_hal_dep = dependency('edgefirst-hal', required : false)
+  if edgefirst_hal_dep.found()
+    tflite2_compile_args += '-DHAVE_EDGEFIRST_HAL=1'
+    nnstreamer_filter_tflite2_deps += edgefirst_hal_dep
+    message('EdgeFirst HAL delegate DMA-BUF support enabled')
+  endif
+
   tflite2_extra_dep = declare_dependency(
     compile_args : tflite2_compile_args
   )

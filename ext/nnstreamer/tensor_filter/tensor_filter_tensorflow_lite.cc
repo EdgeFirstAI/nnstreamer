@@ -46,6 +46,10 @@
 #include <nnstreamer_util.h>
 #include <nnstreamer_tensor_quant_meta.h>
 
+#ifdef HAVE_EDGEFIRST_HAL
+#include <edgefirst/hal.h>
+#endif
+
 #if TFLITE_VERSION_MAJOR < 2
 #pragma message("tensor_filter of TensorFlow Lite version 1.X is deprecated. Please use of TF Lite 2.X")
 #endif
@@ -351,6 +355,90 @@ vx_dmabuf_api_load (const char *lib_path)
 
   /* Don't dlclose — the library is in use by the delegate */
 }
+
+/* ========== HAL Delegate DMA-BUF API (EDGEAI-1189) ================= */
+
+#ifdef HAVE_EDGEFIRST_HAL
+/**
+ * @brief HAL Delegate DMA-BUF API function pointers loaded via dlsym.
+ *
+ * These are loaded at runtime from any external delegate library that
+ * exports the hal_dmabuf_* symbols defined in edgefirst/hal.h.
+ * Currently supported by the Neutron delegate (libneutron_delegate.so)
+ * on i.MX 95 and will be supported by the VX delegate in the future.
+ *
+ * Unlike VxDmaBufAPI, the HAL delegate API uses a simpler model:
+ * the delegate manages its own DMA-BUF allocations and exposes them
+ * via hal_dmabuf_get_tensor_info(). No register/bind/request needed.
+ */
+typedef struct {
+  gboolean loaded;       /**< TRUE if dlsym loading was attempted */
+  gboolean available;    /**< TRUE if hal_dmabuf_is_supported returned 1 */
+
+  int (*is_supported) (hal_delegate_t delegate);
+  int (*get_tensor_info) (hal_delegate_t delegate, int tensor_index,
+                          hal_dmabuf_tensor_info *info, size_t info_size);
+  int (*sync_for_device) (hal_delegate_t delegate, int tensor_index);
+  int (*sync_for_cpu) (hal_delegate_t delegate, int tensor_index);
+} HalDmaBufAPI;
+
+static HalDmaBufAPI hal_dmabuf_api = {};
+
+/**
+ * @brief Load HAL Delegate DMA-BUF API symbols via dlsym.
+ * @param lib_path Path to the external delegate shared library.
+ *
+ * Probes for hal_dmabuf_* symbols in the delegate library. If found and
+ * hal_dmabuf_is_supported() returns 1 for the given delegate, sets
+ * hal_dmabuf_api.available = TRUE.
+ *
+ * @param delegate The TfLiteDelegate pointer (cast to hal_delegate_t for probing).
+ */
+static void
+hal_dmabuf_api_load (const char *lib_path, void *delegate)
+{
+  void *handle;
+
+  if (hal_dmabuf_api.loaded || !lib_path)
+    return;
+
+  hal_dmabuf_api.loaded = TRUE;
+
+  handle = dlopen (lib_path, RTLD_LAZY | RTLD_NOLOAD);
+  if (!handle)
+    handle = dlopen (lib_path, RTLD_LAZY);
+  if (!handle) {
+    nns_logi ("HAL Delegate DMA-BUF API not available: %s", dlerror ());
+    return;
+  }
+
+#define LOAD_HAL_SYM(field, sym) \
+  *(void **) (&hal_dmabuf_api.field) = dlsym (handle, sym)
+
+  LOAD_HAL_SYM (is_supported, "hal_dmabuf_is_supported");
+  LOAD_HAL_SYM (get_tensor_info, "hal_dmabuf_get_tensor_info");
+  LOAD_HAL_SYM (sync_for_device, "hal_dmabuf_sync_for_device");
+  LOAD_HAL_SYM (sync_for_cpu, "hal_dmabuf_sync_for_cpu");
+
+#undef LOAD_HAL_SYM
+
+  if (hal_dmabuf_api.is_supported && hal_dmabuf_api.get_tensor_info) {
+    /* Probe with the actual delegate to check runtime support */
+    if (delegate && hal_dmabuf_api.is_supported ((hal_delegate_t) delegate)) {
+      hal_dmabuf_api.available = TRUE;
+      nns_logi ("HAL Delegate DMA-BUF API loaded and supported from %s", lib_path);
+    } else {
+      nns_logi ("HAL Delegate DMA-BUF API found in %s but delegate reports "
+          "not supported (no DMA-BUF buffers available)", lib_path);
+    }
+  } else {
+    nns_logi ("HAL Delegate DMA-BUF API not found in %s "
+        "(symbols missing — not a HAL-aware delegate)", lib_path);
+  }
+
+  /* Don't dlclose — the library is in use by the delegate */
+}
+#endif /* HAVE_EDGEFIRST_HAL */
 
 /* ========== NnsDmaBufInputPool: single DMA-BUF buffer pool ========== */
 
@@ -1028,6 +1116,15 @@ TFLiteInterpreter::loadModel (int num_threads, tflite_delegate_e delegate_e)
     ml_loge ("Failed to allocate tensors\n");
     return -2;
   }
+
+#ifdef HAVE_EDGEFIRST_HAL
+  /* Probe for HAL delegate DMA-BUF API after delegate is fully initialized.
+   * The delegate must have allocated its internal buffers (AllocateTensors)
+   * before hal_dmabuf_is_supported() can detect DMA-BUF availability. */
+  if (delegate_e == TFLITE_DELEGATE_EXTERNAL && ext_delegate_path) {
+    hal_dmabuf_api_load (ext_delegate_path, (void *) delegate);
+  }
+#endif
 
 #if (DBG)
   stop_time = g_get_monotonic_time ();
