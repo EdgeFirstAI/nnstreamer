@@ -2617,6 +2617,12 @@ tflite_invoke_v2 (const GstTensorFilterProperties *prop, void **private_data,
   }
 
   /* 2. Invoke the model */
+#ifdef HAVE_EDGEFIRST_HAL
+  if (core->hal_dmabuf.initialized && hal_dmabuf_api.sync_for_device)
+    hal_dmabuf_api.sync_for_device (core->hal_dmabuf.delegate_handle,
+        core->hal_dmabuf.input_tensor_idx);
+#endif
+
   start_time = g_get_monotonic_time ();
   status = tfl_interp->Invoke ();
   {
@@ -2624,6 +2630,13 @@ tflite_invoke_v2 (const GstTensorFilterProperties *prop, void **private_data,
     tflite_internal_stats.total_invoke_latency += stop_time - start_time;
     tflite_internal_stats.total_invoke_num += 1;
   }
+
+#ifdef HAVE_EDGEFIRST_HAL
+  if (core->hal_dmabuf.initialized && hal_dmabuf_api.sync_for_cpu) {
+    for (int idx : tfl_interp->outputs ())
+      hal_dmabuf_api.sync_for_cpu (core->hal_dmabuf.delegate_handle, idx);
+  }
+#endif
 
   if (status != kTfLiteOk) {
     ml_loge ("tflite_invoke_v2: TFLite Invoke() failed");
