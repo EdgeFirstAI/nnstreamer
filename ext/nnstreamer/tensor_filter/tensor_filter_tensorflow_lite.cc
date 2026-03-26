@@ -2142,13 +2142,13 @@ TFLiteCore::setupHalDmaBuf ()
   if (hal_dmabuf_api.get_instance)
     hal_dlg = hal_dmabuf_api.get_instance ();
   if (!hal_dlg) {
-    g_printerr ("[DMABUF-DEBUG] hal_dmabuf_get_instance returned NULL\n");
+    nns_logd ("HAL delegate: get_instance returned NULL");
     return FALSE;
   }
 
   /* Check runtime support with the correct delegate handle */
   if (hal_dmabuf_api.is_supported && !hal_dmabuf_api.is_supported (hal_dlg)) {
-    g_printerr ("[DMABUF-DEBUG] hal_dmabuf_is_supported returned 0 for delegate %p\n", hal_dlg);
+    nns_logd ("HAL delegate: is_supported returned 0 for %p", hal_dlg);
     return FALSE;
   }
 
@@ -2158,7 +2158,7 @@ TFLiteCore::setupHalDmaBuf ()
 
   int rc = hal_dmabuf_api.get_tensor_info (
       hal_dlg, tensor_idx, &info, sizeof (info));
-  g_printerr ("[DMABUF-DEBUG] get_tensor_info(%p, %d) rc=%d fd=%d offset=%zu size=%zu\n",
+  nns_logd ("HAL delegate: get_tensor_info(%p, %d) rc=%d fd=%d offset=%zu size=%zu",
       hal_dlg, tensor_idx, rc, info.fd, info.offset, info.size);
   if (rc != 0 || info.fd < 0) {
     nns_logi ("HAL DMA-BUF not available for input tensor %d (rc=%d fd=%d)",
@@ -2243,7 +2243,7 @@ tflite_parseCustomOption (const GstTensorFilterProperties *prop, tflite_option_s
   option->qnn_backend_type = QNN_BACKEND_UNDEFINED;
   option->qnn_performance_mode = QNN_PERFMODE_Default;
   option->camera_adaptor_format = nullptr;
-  option->dmabuf_enabled = false;  /* default off until HAL offset import validated (see ~/hal/NEUTRON_MALI_DMA.md) */
+  option->dmabuf_enabled = true;  /* HAL 0.13.2 fixes GL + G2D offset import for Neutron fds */
 
   if (prop->custom_properties) {
     gchar **strv;
@@ -2421,22 +2421,20 @@ tflite_loadModelFile (const GstTensorFilterProperties *prop, void **private_data
   *private_data = core;
 
   /* Only set up DMA-BUF when enabled (default: true, override via DmaBuf:false) */
-  g_printerr ("[DMABUF-DEBUG] isDmaBufEnabled=%d extDelegatePath=%s\n",
-      core->isDmaBufEnabled (), core->getExtDelegatePath () ? core->getExtDelegatePath () : "(null)");
+  nns_logd ("DmaBuf=%s delegate=%s",
+      core->isDmaBufEnabled () ? "true" : "false",
+      core->getExtDelegatePath () ? core->getExtDelegatePath () : "(none)");
   if (core->isDmaBufEnabled ()) {
     vx_dmabuf_api_load (core->getExtDelegatePath ());
     core->setupOutputDmaBuf ();
     core->setupInputDmaBuf ();
-    g_printerr ("[DMABUF-DEBUG] VxDelegate in_dmabuf.initialized=%d\n",
-        core->in_dmabuf.initialized);
 
 #ifdef HAVE_EDGEFIRST_HAL
     /* Try HAL delegate DMA-BUF if VxDelegate path didn't initialize */
     if (!core->in_dmabuf.initialized) {
-      g_printerr ("[DMABUF-DEBUG] Trying HAL delegate... hal_dmabuf_api.available=%d\n",
+      nns_logd ("VxDelegate not available, trying HAL delegate (available=%d)",
           hal_dmabuf_api.available);
-      gboolean hal_ok = core->setupHalDmaBuf ();
-      g_printerr ("[DMABUF-DEBUG] setupHalDmaBuf returned %d\n", hal_ok);
+      core->setupHalDmaBuf ();
     }
 #endif
   }
@@ -2514,11 +2512,15 @@ tflite_invoke_v2 (const GstTensorFilterProperties *prop, void **private_data,
   for (unsigned int i = 0; i < num_input; i++)
     in_handles[i] = kTfLiteNullBufferHandle;
 
-  /* Check if DMA-BUF zero-copy is available */
+  /* Check if DMA-BUF zero-copy is available (VxDelegate or HAL delegate) */
   gboolean use_dmabuf = FALSE;
   if (delegate && vx_dmabuf_api.available && vx_dmabuf_api.IsDmaBufSupported) {
     use_dmabuf = vx_dmabuf_api.IsDmaBufSupported (delegate);
   }
+#ifdef HAVE_EDGEFIRST_HAL
+  if (!use_dmabuf && core->hal_dmabuf.initialized)
+    use_dmabuf = TRUE;
+#endif
 
   int64_t start_time = g_get_monotonic_time ();
 
@@ -2539,11 +2541,21 @@ tflite_invoke_v2 (const GstTensorFilterProperties *prop, void **private_data,
 
       /* Check if this is our pre-allocated input DMA-BUF (already bound) */
       if (core->in_dmabuf.initialized && fd == core->in_dmabuf.fd) {
-        /* Skip registration — buffer is already bound to tensor */
+        /* Skip registration — buffer is already bound to tensor (VxDelegate) */
         in_dmabuf[i] = TRUE;
-        in_handles[i] = kTfLiteNullBufferHandle;  /* nothing to unregister */
+        in_handles[i] = kTfLiteNullBufferHandle;
         continue;
       }
+#ifdef HAVE_EDGEFIRST_HAL
+      if (core->hal_dmabuf.initialized && fd == core->hal_dmabuf.input_fd) {
+        /* HAL delegate zero-copy: the cameraadaptor rendered directly into
+         * the delegate's DMA-BUF at the correct offset. The delegate's
+         * input tensor is already bound to this buffer — skip everything. */
+        in_dmabuf[i] = TRUE;
+        in_handles[i] = kTfLiteNullBufferHandle;
+        continue;
+      }
+#endif
 
       /* CameraAdaptor: per-frame DMA-BUF rebinding is incompatible with the
        * compiled TIM-VX graph — the CameraAdaptor Slice op reads from the
