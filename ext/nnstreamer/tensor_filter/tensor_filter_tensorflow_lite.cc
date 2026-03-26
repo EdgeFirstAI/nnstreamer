@@ -2243,7 +2243,7 @@ tflite_parseCustomOption (const GstTensorFilterProperties *prop, tflite_option_s
   option->qnn_backend_type = QNN_BACKEND_UNDEFINED;
   option->qnn_performance_mode = QNN_PERFMODE_Default;
   option->camera_adaptor_format = nullptr;
-  option->dmabuf_enabled = true;
+  option->dmabuf_enabled = false;  /* default off until HAL offset import validated (see ~/hal/NEUTRON_MALI_DMA.md) */
 
   if (prop->custom_properties) {
     gchar **strv;
