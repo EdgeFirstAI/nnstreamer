@@ -380,6 +380,7 @@ typedef struct {
                           hal_dmabuf_tensor_info *info, size_t info_size);
   int (*sync_for_device) (hal_delegate_t delegate, int tensor_index);
   int (*sync_for_cpu) (hal_delegate_t delegate, int tensor_index);
+  hal_delegate_t (*get_instance) (void);  /**< Retrieve delegate's internal handle */
 } HalDmaBufAPI;
 
 static HalDmaBufAPI hal_dmabuf_api = {};
@@ -395,7 +396,7 @@ static HalDmaBufAPI hal_dmabuf_api = {};
  * @param delegate The TfLiteDelegate pointer (cast to hal_delegate_t for probing).
  */
 static void
-hal_dmabuf_api_load (const char *lib_path, void *delegate)
+hal_dmabuf_api_load (const char *lib_path, void *delegate G_GNUC_UNUSED)
 {
   void *handle;
 
@@ -419,18 +420,15 @@ hal_dmabuf_api_load (const char *lib_path, void *delegate)
   LOAD_HAL_SYM (get_tensor_info, "hal_dmabuf_get_tensor_info");
   LOAD_HAL_SYM (sync_for_device, "hal_dmabuf_sync_for_device");
   LOAD_HAL_SYM (sync_for_cpu, "hal_dmabuf_sync_for_cpu");
+  LOAD_HAL_SYM (get_instance, "hal_dmabuf_get_instance");
 
 #undef LOAD_HAL_SYM
 
   if (hal_dmabuf_api.is_supported && hal_dmabuf_api.get_tensor_info) {
-    /* Probe with the actual delegate to check runtime support */
-    if (delegate && hal_dmabuf_api.is_supported ((hal_delegate_t) delegate)) {
-      hal_dmabuf_api.available = TRUE;
-      nns_logi ("HAL Delegate DMA-BUF API loaded and supported from %s", lib_path);
-    } else {
-      nns_logi ("HAL Delegate DMA-BUF API found in %s but delegate reports "
-          "not supported (no DMA-BUF buffers available)", lib_path);
-    }
+    /* Symbols found — mark available. Runtime support check deferred to
+     * setupHalDmaBuf() which has access to the correct delegate handle. */
+    hal_dmabuf_api.available = TRUE;
+    nns_logi ("HAL Delegate DMA-BUF API symbols found in %s", lib_path);
   } else {
     nns_logi ("HAL Delegate DMA-BUF API not found in %s "
         "(symbols missing — not a HAL-aware delegate)", lib_path);
@@ -2133,15 +2131,35 @@ TFLiteCore::setupHalDmaBuf ()
 
   tflite::Interpreter *interp = getTfLiteInterpreter ();
   TfLiteDelegate *dlg = getDelegate ();
+
   if (!interp || !dlg || interp->inputs ().empty ())
     return FALSE;
+
+  /* Get the delegate's internal handle via hal_dmabuf_get_instance().
+   * TfLiteExternalDelegate wraps the real delegate; the HAL API needs
+   * the inner pointer that was registered with dmabuf_set_delegate(). */
+  hal_delegate_t hal_dlg = NULL;
+  if (hal_dmabuf_api.get_instance)
+    hal_dlg = hal_dmabuf_api.get_instance ();
+  if (!hal_dlg) {
+    g_printerr ("[DMABUF-DEBUG] hal_dmabuf_get_instance returned NULL\n");
+    return FALSE;
+  }
+
+  /* Check runtime support with the correct delegate handle */
+  if (hal_dmabuf_api.is_supported && !hal_dmabuf_api.is_supported (hal_dlg)) {
+    g_printerr ("[DMABUF-DEBUG] hal_dmabuf_is_supported returned 0 for delegate %p\n", hal_dlg);
+    return FALSE;
+  }
 
   int tensor_idx = interp->inputs ()[0];
   hal_dmabuf_tensor_info info = {};
   info.fd = -1;
 
   int rc = hal_dmabuf_api.get_tensor_info (
-      (hal_delegate_t) dlg, tensor_idx, &info, sizeof (info));
+      hal_dlg, tensor_idx, &info, sizeof (info));
+  g_printerr ("[DMABUF-DEBUG] get_tensor_info(%p, %d) rc=%d fd=%d offset=%zu size=%zu\n",
+      hal_dlg, tensor_idx, rc, info.fd, info.offset, info.size);
   if (rc != 0 || info.fd < 0) {
     nns_logi ("HAL DMA-BUF not available for input tensor %d (rc=%d fd=%d)",
         tensor_idx, rc, info.fd);
@@ -2178,7 +2196,7 @@ TFLiteCore::setupHalDmaBuf ()
   hal_dmabuf.input_tensor_idx = tensor_idx;
   hal_dmabuf.map_ptr = map_ptr;
   hal_dmabuf.input_pool = GST_BUFFER_POOL (pool);
-  hal_dmabuf.delegate_handle = (hal_delegate_t) dlg;
+  hal_dmabuf.delegate_handle = hal_dlg;  /* Inner delegate from get_instance() */
 
   nns_logi ("HAL DMA-BUF input enabled: tensor=%d fd=%d offset=%zu size=%zu",
       tensor_idx, info.fd, (size_t) info.offset, (size_t) info.size);
@@ -2403,15 +2421,23 @@ tflite_loadModelFile (const GstTensorFilterProperties *prop, void **private_data
   *private_data = core;
 
   /* Only set up DMA-BUF when enabled (default: true, override via DmaBuf:false) */
+  g_printerr ("[DMABUF-DEBUG] isDmaBufEnabled=%d extDelegatePath=%s\n",
+      core->isDmaBufEnabled (), core->getExtDelegatePath () ? core->getExtDelegatePath () : "(null)");
   if (core->isDmaBufEnabled ()) {
     vx_dmabuf_api_load (core->getExtDelegatePath ());
     core->setupOutputDmaBuf ();
     core->setupInputDmaBuf ();
+    g_printerr ("[DMABUF-DEBUG] VxDelegate in_dmabuf.initialized=%d\n",
+        core->in_dmabuf.initialized);
 
 #ifdef HAVE_EDGEFIRST_HAL
     /* Try HAL delegate DMA-BUF if VxDelegate path didn't initialize */
-    if (!core->in_dmabuf.initialized)
-      core->setupHalDmaBuf ();
+    if (!core->in_dmabuf.initialized) {
+      g_printerr ("[DMABUF-DEBUG] Trying HAL delegate... hal_dmabuf_api.available=%d\n",
+          hal_dmabuf_api.available);
+      gboolean hal_ok = core->setupHalDmaBuf ();
+      g_printerr ("[DMABUF-DEBUG] setupHalDmaBuf returned %d\n", hal_ok);
+    }
 #endif
   }
 
