@@ -2117,6 +2117,96 @@ TFLiteCore::releaseInputDmaBuf ()
   memset (&in_dmabuf, 0, sizeof (in_dmabuf));
 }
 
+#ifdef HAVE_EDGEFIRST_HAL
+/**
+ * @brief Set up HAL delegate DMA-BUF input pool.
+ *
+ * Queries the HAL delegate for DMA-BUF tensor info for input tensor 0,
+ * creates a GstBufferPool wrapping the fd, and mmaps for CPU fallback.
+ * This is the HAL delegate equivalent of setupInputDmaBuf() (VxDelegate).
+ */
+gboolean
+TFLiteCore::setupHalDmaBuf ()
+{
+  if (hal_dmabuf.initialized || !hal_dmabuf_api.available)
+    return FALSE;
+
+  tflite::Interpreter *interp = getTfLiteInterpreter ();
+  TfLiteDelegate *dlg = getDelegate ();
+  if (!interp || !dlg || interp->inputs ().empty ())
+    return FALSE;
+
+  int tensor_idx = interp->inputs ()[0];
+  hal_dmabuf_tensor_info info = {};
+  info.fd = -1;
+
+  int rc = hal_dmabuf_api.get_tensor_info (
+      (hal_delegate_t) dlg, tensor_idx, &info, sizeof (info));
+  if (rc != 0 || info.fd < 0) {
+    nns_logi ("HAL DMA-BUF not available for input tensor %d (rc=%d fd=%d)",
+        tensor_idx, rc, info.fd);
+    return FALSE;
+  }
+
+  /* Create buffer pool wrapping this fd */
+  NnsDmaBufInputPool *pool = (NnsDmaBufInputPool *)
+      g_object_new (nns_dmabuf_input_pool_get_type (), NULL);
+  pool->fd = info.fd;
+  pool->buf_size = info.size;
+  pool->offset = info.offset;
+
+  GstStructure *config = gst_buffer_pool_get_config (GST_BUFFER_POOL (pool));
+  GstAllocator *dmabuf_alloc = gst_dmabuf_allocator_new ();
+  gst_buffer_pool_config_set_params (config, NULL, info.size, 1, 1);
+  gst_buffer_pool_config_set_allocator (config, dmabuf_alloc, NULL);
+  gst_buffer_pool_set_config (GST_BUFFER_POOL (pool), config);
+  gst_object_unref (dmabuf_alloc);
+
+  /* mmap the DMA-BUF for CPU memcpy fallback */
+  void *map_ptr = mmap (NULL, info.offset + info.size,
+      PROT_READ | PROT_WRITE, MAP_SHARED, info.fd, 0);
+  if (map_ptr == MAP_FAILED) {
+    nns_logw ("HAL DMA-BUF mmap failed (fd=%d offset=%zu size=%zu): %s",
+        info.fd, (size_t) info.offset, (size_t) info.size, g_strerror (errno));
+    map_ptr = NULL;
+  }
+
+  hal_dmabuf.initialized = TRUE;
+  hal_dmabuf.input_fd = info.fd;
+  hal_dmabuf.input_offset = info.offset;
+  hal_dmabuf.input_size = info.size;
+  hal_dmabuf.input_tensor_idx = tensor_idx;
+  hal_dmabuf.map_ptr = map_ptr;
+  hal_dmabuf.input_pool = GST_BUFFER_POOL (pool);
+  hal_dmabuf.delegate_handle = (hal_delegate_t) dlg;
+
+  nns_logi ("HAL DMA-BUF input enabled: tensor=%d fd=%d offset=%zu size=%zu",
+      tensor_idx, info.fd, (size_t) info.offset, (size_t) info.size);
+  return TRUE;
+}
+
+/**
+ * @brief Release HAL delegate DMA-BUF resources.
+ */
+void
+TFLiteCore::releaseHalDmaBuf ()
+{
+  if (!hal_dmabuf.initialized)
+    return;
+
+  if (hal_dmabuf.map_ptr) {
+    munmap (hal_dmabuf.map_ptr, hal_dmabuf.input_offset + hal_dmabuf.input_size);
+  }
+
+  if (hal_dmabuf.input_pool) {
+    gst_buffer_pool_set_active (hal_dmabuf.input_pool, FALSE);
+    gst_object_unref (hal_dmabuf.input_pool);
+  }
+
+  memset (&hal_dmabuf, 0, sizeof (hal_dmabuf));
+}
+#endif /* HAVE_EDGEFIRST_HAL */
+
 /**
  * @brief Internal function to get the option for tf-lite model.
  */
@@ -2261,6 +2351,9 @@ tflite_close (const GstTensorFilterProperties *prop, void **private_data)
 
   core->releaseInputDmaBuf ();
   core->releaseOutputDmaBuf ();
+#ifdef HAVE_EDGEFIRST_HAL
+  core->releaseHalDmaBuf ();
+#endif
   delete core;
   *private_data = NULL;
 }
@@ -2309,11 +2402,17 @@ tflite_loadModelFile (const GstTensorFilterProperties *prop, void **private_data
 
   *private_data = core;
 
-  /* Only set up DMA-BUF when explicitly enabled via DmaBuf:true */
+  /* Only set up DMA-BUF when enabled (default: true, override via DmaBuf:false) */
   if (core->isDmaBufEnabled ()) {
     vx_dmabuf_api_load (core->getExtDelegatePath ());
     core->setupOutputDmaBuf ();
     core->setupInputDmaBuf ();
+
+#ifdef HAVE_EDGEFIRST_HAL
+    /* Try HAL delegate DMA-BUF if VxDelegate path didn't initialize */
+    if (!core->in_dmabuf.initialized)
+      core->setupHalDmaBuf ();
+#endif
   }
 
 done:
@@ -2786,13 +2885,24 @@ tflite_propose_allocation_v2 (const GstTensorFilterProperties *prop,
   if (!core || !query || !core->isDmaBufEnabled ())
     return 0;
 
-  /* Add delegate-owned input DMA-BUF pool if available */
+  /* Add delegate-owned input DMA-BUF pool if available (VxDelegate) */
   if (core->in_dmabuf.initialized && core->in_dmabuf.pool) {
     gst_query_add_allocation_pool (
         query, core->in_dmabuf.pool, core->in_dmabuf.size, 1, 1);
     nns_logi ("Proposed input DMA-BUF pool: fd=%d size=%zu",
         core->in_dmabuf.fd, core->in_dmabuf.size);
   }
+
+#ifdef HAVE_EDGEFIRST_HAL
+  /* Add HAL delegate input DMA-BUF pool if available */
+  if (core->hal_dmabuf.initialized && core->hal_dmabuf.input_pool) {
+    gst_query_add_allocation_pool (
+        query, core->hal_dmabuf.input_pool, core->hal_dmabuf.input_size, 1, 1);
+    nns_logi ("Proposed HAL DMA-BUF input pool: fd=%d offset=%zu size=%zu",
+        core->hal_dmabuf.input_fd, core->hal_dmabuf.input_offset,
+        core->hal_dmabuf.input_size);
+  }
+#endif
 
   /* Add DMA-BUF allocator to allocation params */
   GstAllocator *dmabuf_alloc = gst_dmabuf_allocator_new ();
