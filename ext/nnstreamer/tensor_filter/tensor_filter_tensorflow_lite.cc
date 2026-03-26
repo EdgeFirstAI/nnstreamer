@@ -446,6 +446,7 @@ typedef struct {
   GstBufferPool parent;
   int fd;           /**< delegate-allocated DMA-BUF fd */
   gsize buf_size;   /**< buffer size in bytes */
+  gsize offset;     /**< byte offset within DMA-BUF for tensor data */
 } NnsDmaBufInputPool;
 
 typedef struct {
@@ -462,12 +463,18 @@ nns_dmabuf_pool_alloc (GstBufferPool *pool, GstBuffer **buffer,
   UNUSED (params);
 
   GstAllocator *alloc = gst_dmabuf_allocator_new ();
+  gsize alloc_size = self->offset + self->buf_size;
   GstMemory *mem = gst_dmabuf_allocator_alloc_with_flags (
-      alloc, self->fd, self->buf_size, GST_FD_MEMORY_FLAG_DONT_CLOSE);
+      alloc, self->fd, alloc_size, GST_FD_MEMORY_FLAG_DONT_CLOSE);
   gst_object_unref (alloc);
 
   if (G_UNLIKELY (!mem))
     return GST_FLOW_ERROR;
+
+  /* If there is an offset within the DMA-BUF, expose only the tensor data
+   * region so downstream sees the correct size via gst_memory_get_sizes(). */
+  if (self->offset > 0)
+    gst_memory_resize (mem, self->offset, self->buf_size);
 
   *buffer = gst_buffer_new ();
   gst_buffer_append_memory (*buffer, mem);
@@ -505,6 +512,7 @@ nns_dmabuf_pool_init (GTypeInstance *instance, gpointer g_class)
   UNUSED (g_class);
   self->fd = -1;
   self->buf_size = 0;
+  self->offset = 0;
 }
 
 static GType
@@ -683,6 +691,13 @@ class TFLiteCore
   /** @brief Request input DMA-BUF from VxDelegate and create buffer pool */
   gboolean setupInputDmaBuf ();
 
+#ifdef HAVE_EDGEFIRST_HAL
+  /** @brief Set up HAL delegate DMA-BUF input pool */
+  gboolean setupHalDmaBuf ();
+  /** @brief Release HAL delegate DMA-BUF resources */
+  void releaseHalDmaBuf ();
+#endif
+
   /** @brief Check if CameraAdaptor is active for this instance */
   gboolean hasCameraAdaptor () { return camera_adaptor.active; }
 
@@ -712,6 +727,20 @@ class TFLiteCore
     void *map_ptr;         /**< mmap'd pointer to DMA-BUF for CPU memcpy fallback */
     GstBufferPool *pool;   /**< pool wrapping the DMA-BUF fd, proposed upstream */
   } in_dmabuf;
+
+#ifdef HAVE_EDGEFIRST_HAL
+  /* HAL delegate DMA-BUF state (parallel to VxDelegate in_dmabuf) */
+  struct {
+    gboolean initialized;       /**< TRUE if HAL DMA-BUF input was set up */
+    int input_fd;               /**< DMA-BUF fd for input tensor */
+    size_t input_offset;        /**< byte offset within DMA-BUF */
+    size_t input_size;          /**< tensor data size in bytes */
+    int input_tensor_idx;       /**< TFLite tensor index */
+    void *map_ptr;              /**< mmap'd pointer for CPU fallback */
+    GstBufferPool *input_pool;  /**< pool wrapping the DMA-BUF fd */
+    hal_delegate_t delegate_handle;  /**< delegate pointer for sync calls */
+  } hal_dmabuf = {};
+#endif
 
   bool dmabuf_enabled = false; /**< Whether DMA-BUF zero-copy is enabled for this instance */
 
