@@ -134,11 +134,138 @@ Key features:
 - **Allocation proxy**: `tensor_converter` forwards allocation queries so hardware video converters see the NPU's buffer pool
 - **`propose_allocation` callback**: V2 sub-plugins can add custom buffer pools to GStreamer's allocation negotiation
 
+### HAL Delegate DMA-BUF Framework
+
+The EdgeFirst HAL (`~/hal`) defines a standardized ABI for querying DMA-BUF tensor information from external TFLite delegates. This enables unified multi-delegate zero-copy support from a single code path in the TFLite filter, without vendor-specific conditionals.
+
+The full API specification is in [ARCHITECTURE.md Appendix B](https://github.com/EdgeFirstAI/hal/blob/main/ARCHITECTURE.md#appendix-b-delegate-dma-buf-framework). The NNStreamer TFLite filter implements the consumer side in `ext/nnstreamer/tensor_filter/tensor_filter_tensorflow_lite.cc`.
+
+#### Supported Delegates
+
+| Delegate | Library | DMA-BUF API |
+|----------|---------|-------------|
+| NXP VX Delegate (i.MX 8M Plus) | `libvx_delegate.so` | HAL `hal_dmabuf_*` (and legacy `VxDelegate*` fallback) |
+| NXP Neutron Delegate (i.MX 95) | `libneutron_delegate.so` | HAL `hal_dmabuf_*` |
+
+Both delegates implement the same C ABI exported as default-visibility symbols, allowing the TFLite filter to probe them identically.
+
+#### ABI Contract
+
+The delegate library must export the following C symbols:
+
+```c
+/* Returns inner delegate handle (unwraps TfLiteExternalDelegate wrapper) */
+hal_delegate_t hal_dmabuf_get_instance(void);
+
+/* Returns 1 if DMA-BUF zero-copy is available for this delegate instance */
+int hal_dmabuf_is_supported(hal_delegate_t delegate);
+
+/* Queries fd, offset, size, shape, dtype for a given tensor index */
+int hal_dmabuf_get_tensor_info(hal_delegate_t delegate,
+                               int tensor_index,
+                               hal_dmabuf_tensor_info *info,
+                               size_t info_size);
+
+/* Flush CPU caches → NPU can read (call before Invoke) */
+int hal_dmabuf_sync_for_device(hal_delegate_t delegate, int tensor_index);
+
+/* Invalidate CPU caches → CPU sees NPU writes (call after Invoke) */
+int hal_dmabuf_sync_for_cpu(hal_delegate_t delegate, int tensor_index);
+```
+
+The `hal_dmabuf_tensor_info` struct carries:
+
+| Field    | Type                           | Description |
+|----------|--------------------------------|-------------|
+| `size`   | `size_t`                       | Buffer size in bytes (may exceed logical tensor size) |
+| `offset` | `size_t`                       | Byte offset within the DMA-BUF (for sub-allocated buffers) |
+| `shape`  | `size_t[HAL_DMABUF_MAX_NDIM]`  | Tensor dimensions (max 8) |
+| `ndim`   | `size_t`                       | Number of valid entries in `shape` |
+| `fd`     | `int`                          | Borrowed DMA-BUF file descriptor (do not close) |
+| `dtype`  | `hal_dtype`                    | Element data type |
+
+The delegate **owns** all DMA-BUF allocations. The file descriptors returned by `hal_dmabuf_get_tensor_info()` are borrowed references — the TFLite filter never closes them.
+
+#### Camera Adaptor Query API
+
+Some delegates perform NPU-accelerated format conversion (e.g. RGBA→RGB channel slicing, uint8→int8 requantization) as part of their inference graph. Two additional symbols allow the filter to query this capability without vendor-specific code:
+
+```c
+int hal_camera_adaptor_is_supported(hal_delegate_t delegate, const char *format);
+int hal_camera_adaptor_get_format_info(hal_delegate_t delegate,
+                                       const char *format,
+                                       hal_camera_adaptor_format_info *info,
+                                       size_t info_size);
+```
+
+#### Integration in the TFLite Filter
+
+At model open time (`setupHalDmaBuf()`), the TFLite filter:
+
+1. Calls `dlsym` on the external delegate library path for each `hal_dmabuf_*` symbol.
+2. Calls `hal_dmabuf_get_instance()` to obtain the inner delegate handle (needed because `TfLiteExternalDelegateCreate()` wraps the real delegate in an opaque adapter).
+3. Calls `hal_dmabuf_is_supported()` to confirm the delegate has an active DMA-BUF allocation.
+4. Calls `hal_dmabuf_get_tensor_info()` on the first input tensor to obtain `fd`, `offset`, and `size`.
+5. Wraps the fd in a `NnsDmaBufInputPool` (a single-buffer `GstBufferPool`) and mmaps the buffer for CPU memcpy fallback.
+
+At inference time:
+
+```
+upstream (G2D/edgefirstcameraadaptor) writes into DMA-BUF
+  → hal_dmabuf_sync_for_device()   ← flush CPU caches
+  → TFLite Interpreter::Invoke()   ← NPU inference
+  → hal_dmabuf_sync_for_cpu()      ← invalidate CPU caches
+  → read output tensors (CPU)
+```
+
+#### Zero-Copy Data Flow (Full Pipeline)
+
+```
+Camera DMA-BUF (V4L2)
+  → edgefirstcameraadaptor or imxvideoconvert_g2d
+  → writes directly into delegate input DMA-BUF (fd from hal_dmabuf_get_tensor_info)
+  → hal_dmabuf_sync_for_device()
+  → NPU inference (zero-copy input)
+  → hal_dmabuf_sync_for_cpu()
+  → CPU post-processing (YOLO decode, NMS)
+```
+
+No CPU memcpy occurs on the input path when `propose_allocation` negotiation succeeds and G2D (or the camera adaptor) writes directly into the delegate's DMA-BUF.
+
 ### Ara-2 NPU Sub-Plugin
 
 The `ara2` tensor_filter sub-plugin provides V2 invoke support for the Kinara Ara-2 NPU with full DMA-BUF zero-copy. All runtime symbols are loaded via `dlopen`/`dlsym` so the sub-plugin degrades gracefully when the Ara-2 runtime is unavailable.
 
 Build with `-Dara2-support=enabled` (auto-detected from `dvapi.h` availability).
+
+#### Ara-2 DMA-BUF Zero-Copy
+
+Unlike the TFLite delegates which use the HAL `hal_dmabuf_*` ABI, the Ara-2 sub-plugin manages its own DMA-BUF allocations natively. At model open time it allocates separate DMA-BUF file descriptors for each input and output tensor via `/dev/dma_heap/linux,cma`:
+
+- **Input DMA-BUFs** are allocated by `setupInputDmaBuf()` and exported to upstream elements via `propose_allocation` (V2 callback). The G2D converter or `edgefirstcameraadaptor` element writes camera frames directly into this buffer without any CPU copy.
+- **Output DMA-BUFs** are allocated by `setupOutputDmaBuf()`. The Ara-2 runtime writes inference results directly into these buffers. For CPU-side post-processing (YOLO decode, NMS) the output is read back via mmap after cache invalidation.
+
+The three-tier `invokeV2` path selects the optimal data transfer strategy per frame:
+
+| Tier | Input | Output | Description |
+|------|-------|--------|-------------|
+| 1 (fastest) | DMA-BUF | DMA-BUF | Full zero-copy — no CPU involvement |
+| 2 | sysmem | DMA-BUF | memcpy into input DMA-BUF, then NPU |
+| 3 (fallback) | sysmem | sysmem | Full sysmem path |
+
+The `dmabuf_enabled_` flag is set only when **both** input and output DMA-BUF setup succeed, ensuring consistent state.
+
+#### Ara-2 Pipeline Example
+
+```
+v4l2src ! video/x-raw,format=NV12 !
+edgefirstcameraadaptor model-width=640 model-height=640
+  model-dtype=int8 model-layout=chw letterbox=true !
+tensor_filter framework=ara2 model=yolov8n.dvm name=nn !
+tensor_sink
+```
+
+The `edgefirstcameraadaptor` element responds to the `propose_allocation` query from `tensor_filter` and writes converted frames directly into the Ara-2 input DMA-BUF.
 
 ### Model Metadata Properties
 
