@@ -2653,9 +2653,17 @@ tflite_invoke_v2 (const GstTensorFilterProperties *prop, void **private_data,
 
   /* 2. Invoke the model */
 #ifdef HAVE_EDGEFIRST_HAL
-  if (core->hal_dmabuf.initialized && hal_dmabuf_api.sync_for_device)
+  /* Only flush CPU caches if we did a CPU memcpy into the HAL DMA-BUF.
+   * The zero-copy pool path uses hardware (G2D/OpenGL) via the HAL to write
+   * the converted frame — no CPU involvement — so the implicit DMABuf fence
+   * between G2D and the Neutron DMA engine provides the required
+   * synchronization.  Calling DMA_BUF_SYNC_END|WRITE here would interfere
+   * with that fence and cause the Neutron driver to time out. */
+  if (core->hal_dmabuf.initialized && hal_dmabuf_api.sync_for_device
+      && in_mapped[0]) {
     hal_dmabuf_api.sync_for_device (core->hal_dmabuf.delegate_handle,
         core->hal_dmabuf.input_tensor_idx);
+  }
 #endif
 
   start_time = g_get_monotonic_time ();
