@@ -2674,17 +2674,26 @@ tflite_invoke_v2 (const GstTensorFilterProperties *prop, void **private_data,
     tflite_internal_stats.total_invoke_num += 1;
   }
 
-#ifdef HAVE_EDGEFIRST_HAL
-  if (core->hal_dmabuf.initialized && hal_dmabuf_api.sync_for_cpu) {
-    for (int idx : tfl_interp->outputs ())
-      hal_dmabuf_api.sync_for_cpu (core->hal_dmabuf.delegate_handle, idx);
-  }
-#endif
-
   if (status != kTfLiteOk) {
     ml_loge ("tflite_invoke_v2: TFLite Invoke() failed");
     goto cleanup;
   }
+
+  /* NOTE: Do NOT call hal_dmabuf_api.sync_for_cpu() here.
+   *
+   * All Neutron input and output tensors share a single DMA-BUF allocation.
+   * sync_for_cpu() issues DMA_BUF_IOCTL_SYNC(START|READ) on the output
+   * tensor fd, which marks the *entire* shared buffer as CPU-busy.
+   *
+   * In the zero-copy pool path (G2D/GL → Neutron DMA-BUF), sync_for_device()
+   * is not called before the next Invoke() because there is no CPU write to
+   * flush — the buffer ownership is never returned to the NPU.  On the second
+   * frame the Neutron DMA engine finds the buffer still marked CPU-busy and
+   * times out (error 383307 DRIVER/TIMEOUT).
+   *
+   * The Neutron delegate copies output tensor data to TFLite's internal CPU
+   * buffers during Invoke(); tensor->data.raw is already CPU-accessible after
+   * Invoke() returns.  No explicit DMA-BUF sync is needed to read outputs. */
 
   /* 3. Handle output tensors */
   if (core->out_dmabuf.initialized) {
