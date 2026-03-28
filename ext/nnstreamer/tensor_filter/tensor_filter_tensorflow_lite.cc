@@ -2535,50 +2535,43 @@ tflite_invoke_v2 (const GstTensorFilterProperties *prop, void **private_data,
     }
 
     if (use_dmabuf && gst_is_dmabuf_memory (mem)) {
-      /* Zero-copy DMA-BUF path */
+      /* Zero-copy DMA-BUF path: delegates publish their own pre-allocated
+       * input DMA-BUF upstream via the allocation pool.  edgefirstcameraadaptor
+       * acquires from that pool and writes the converted frame into it.
+       * The only valid input fd is the delegate-owned one below. */
       int fd = gst_dmabuf_memory_get_fd (mem);
-      gsize size = gst_memory_get_sizes (mem, NULL, NULL);
 
-      /* Check if this is our pre-allocated input DMA-BUF (already bound) */
       if (core->in_dmabuf.initialized && fd == core->in_dmabuf.fd) {
-        /* Skip registration — buffer is already bound to tensor (VxDelegate) */
+        /* VxDelegate: buffer is the pre-allocated input DMA-BUF — already bound */
         in_dmabuf[i] = TRUE;
         in_handles[i] = kTfLiteNullBufferHandle;
         continue;
       }
 #ifdef HAVE_EDGEFIRST_HAL
       if (core->hal_dmabuf.initialized && fd == core->hal_dmabuf.input_fd) {
-        /* HAL delegate zero-copy: the cameraadaptor rendered directly into
-         * the delegate's DMA-BUF at the correct offset. The delegate's
-         * input tensor is already bound to this buffer — skip everything. */
+        /* HAL/Neutron delegate: edgefirstcameraadaptor wrote into the
+         * delegate-owned input DMA-BUF at the negotiated offset — already bound */
         in_dmabuf[i] = TRUE;
         in_handles[i] = kTfLiteNullBufferHandle;
         continue;
       }
 #endif
 
-      /* CameraAdaptor: per-frame DMA-BUF rebinding is incompatible with the
-       * compiled TIM-VX graph — the CameraAdaptor Slice op reads from the
-       * delegate-owned DMA-BUF (fd=N) that was bound during graph compilation.
-       * BindDmaBufToTensor does not propagate through the compiled graph, so
-       * the NPU would read stale data from the original fd instead of the new
-       * one.  Fall through to the CPU memcpy fallback which copies into the
-       * delegate-owned DMA-BUF where the graph expects it. */
-      if (core->hasCameraAdaptor () && i == 0 && core->in_dmabuf.initialized) {
-        /* Fall through to CPU path — gst_memory_map works on DMA-BUF memory */
+      /* Unexpected DMA-BUF fd: VX and Neutron/HAL delegates only export their
+       * own pre-allocated input buffer — they do not import external fds
+       * (HAL API has no import path; per-frame VX rebinding requires a full
+       * graph rebuild).  Upstream element did not write into the delegate-
+       * proposed pool buffer. Fall through to CPU memcpy path. */
+      static gboolean unexpected_fd_warned = FALSE;
+      if (G_UNLIKELY (!unexpected_fd_warned)) {
+        unexpected_fd_warned = TRUE;
+        nns_logw ("Input tensor %u: unexpected DMA-BUF fd=%d "
+            "(expected delegate fd=%d). Upstream element did not write into "
+            "the proposed pool — zero-copy is broken.", i, fd,
+            core->in_dmabuf.initialized ? core->in_dmabuf.fd
+                                        : core->hal_dmabuf.input_fd);
       } else {
-        /* Per-frame registration path (external DMA-BUF, no CameraAdaptor) */
-        in_handles[i] = vx_dmabuf_api.RegisterDmaBuf (
-            delegate, fd, size, 0 /* kVxDmaBufSyncNone */);
-        if (in_handles[i] != kTfLiteNullBufferHandle) {
-          int tensor_idx = tfl_interp->inputs ()[i];
-          vx_dmabuf_api.BindDmaBufToTensor (delegate, in_handles[i], tensor_idx);
-          in_dmabuf[i] = TRUE;
-          continue;
-        }
-        /* Fall through to CPU path on registration failure */
-        ml_logw ("tflite_invoke_v2: DMA-BUF registration failed for input %u, "
-            "falling back to CPU path", i);
+        nns_logd ("Input tensor %u: unexpected DMA-BUF fd=%d, memcpy path", i, fd);
       }
     }
 
@@ -2589,12 +2582,12 @@ tflite_invoke_v2 (const GstTensorFilterProperties *prop, void **private_data,
     }
     in_mapped[i] = TRUE;
 
-    if (core->hasCameraAdaptor () && i == 0
-        && core->in_dmabuf.initialized && core->in_dmabuf.map_ptr) {
-      /* CameraAdaptor memcpy fallback: upstream (e.g., G2D) provided a regular
-       * buffer instead of our proposed DMA-BUF pool.  Copy the 4ch RGBA data
-       * into the delegate-owned input DMA-BUF so the NPU can run Slice
-       * (4ch→3ch) and DataConvert (uint8→int8) via CameraAdaptor. */
+    if (i == 0 && core->in_dmabuf.initialized && core->in_dmabuf.map_ptr) {
+      /* VxDelegate memcpy fallback: the delegate-owned input DMA-BUF is
+       * persistently bound to the input tensor from setupInputDmaBuf(), but
+       * upstream did not write into it via the proposed pool.  Copy the
+       * upstream frame into the delegate's DMA-BUF so the NPU reads the
+       * correct data.  Must not happen in a correctly configured pipeline. */
       gsize copy_size = MIN (in_maps[i].size, core->in_dmabuf.size);
       memcpy (core->in_dmabuf.map_ptr, in_maps[i].data, copy_size);
 
@@ -2608,12 +2601,16 @@ tflite_invoke_v2 (const GstTensorFilterProperties *prop, void **private_data,
         vx_dmabuf_api.SyncForDevice (delegate, core->in_dmabuf.handle);
       }
 
-      static gboolean cam_copy_logged = FALSE;
-      if (G_UNLIKELY (!cam_copy_logged)) {
-        cam_copy_logged = TRUE;
-        nns_logi ("CameraAdaptor memcpy fallback: %zu bytes → DMA-BUF fd=%d "
-            "(upstream did not honor proposed pool)", copy_size,
-            core->in_dmabuf.fd);
+      static gboolean input_copy_warned = FALSE;
+      if (G_UNLIKELY (!input_copy_warned)) {
+        input_copy_warned = TRUE;
+        nns_logw ("Memcpy into delegate input DMA-BUF fd=%d (%zu bytes): "
+            "upstream element did not write into the proposed pool — "
+            "zero-copy is broken.",
+            core->in_dmabuf.fd, copy_size);
+      } else {
+        nns_logd ("Memcpy into delegate input DMA-BUF fd=%d (%zu bytes)",
+            core->in_dmabuf.fd, copy_size);
       }
 
       /* The DMA-BUF is already bound to tensor 0 from setupInputDmaBuf(),
