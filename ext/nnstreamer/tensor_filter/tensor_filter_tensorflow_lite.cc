@@ -734,7 +734,6 @@ class TFLiteCore
     size_t input_offset;        /**< byte offset within DMA-BUF */
     size_t input_size;          /**< tensor data size in bytes */
     int input_tensor_idx;       /**< TFLite tensor index */
-    void *map_ptr;              /**< mmap'd pointer for CPU fallback */
     GstBufferPool *input_pool;  /**< pool wrapping the DMA-BUF fd */
     hal_delegate_t delegate_handle;  /**< delegate pointer for sync calls */
   } hal_dmabuf = {};
@@ -2119,8 +2118,8 @@ TFLiteCore::releaseInputDmaBuf ()
 /**
  * @brief Set up HAL delegate DMA-BUF input pool.
  *
- * Queries the HAL delegate for DMA-BUF tensor info for input tensor 0,
- * creates a GstBufferPool wrapping the fd, and mmaps for CPU fallback.
+ * Queries the HAL delegate for DMA-BUF tensor info for input tensor 0
+ * and creates a GstBufferPool wrapping the fd.
  * This is the HAL delegate equivalent of setupInputDmaBuf() (VxDelegate).
  */
 gboolean
@@ -2180,21 +2179,11 @@ TFLiteCore::setupHalDmaBuf ()
   gst_buffer_pool_set_config (GST_BUFFER_POOL (pool), config);
   gst_object_unref (dmabuf_alloc);
 
-  /* mmap the DMA-BUF for CPU memcpy fallback */
-  void *map_ptr = mmap (NULL, info.offset + info.size,
-      PROT_READ | PROT_WRITE, MAP_SHARED, info.fd, 0);
-  if (map_ptr == MAP_FAILED) {
-    nns_logw ("HAL DMA-BUF mmap failed (fd=%d offset=%zu size=%zu): %s",
-        info.fd, (size_t) info.offset, (size_t) info.size, g_strerror (errno));
-    map_ptr = NULL;
-  }
-
   hal_dmabuf.initialized = TRUE;
   hal_dmabuf.input_fd = info.fd;
   hal_dmabuf.input_offset = info.offset;
   hal_dmabuf.input_size = info.size;
   hal_dmabuf.input_tensor_idx = tensor_idx;
-  hal_dmabuf.map_ptr = map_ptr;
   hal_dmabuf.input_pool = GST_BUFFER_POOL (pool);
   hal_dmabuf.delegate_handle = hal_dlg;  /* Inner delegate from get_instance() */
 
@@ -2211,10 +2200,6 @@ TFLiteCore::releaseHalDmaBuf ()
 {
   if (!hal_dmabuf.initialized)
     return;
-
-  if (hal_dmabuf.map_ptr) {
-    munmap (hal_dmabuf.map_ptr, hal_dmabuf.input_offset + hal_dmabuf.input_size);
-  }
 
   if (hal_dmabuf.input_pool) {
     gst_buffer_pool_set_active (hal_dmabuf.input_pool, FALSE);
