@@ -1016,6 +1016,32 @@ TFLiteInterpreter::loadModel (int num_threads, tflite_delegate_e delegate_e)
     case TFLITE_DELEGATE_EXTERNAL:
       {
 #ifdef TFLITE_EXTERNAL_DELEGATE_SUPPORTED
+        /* Verify the external delegate library exists and can be loaded
+         * BEFORE handing it to TfLiteExternalDelegateCreate. Upstream
+         * TFLite's external_delegate.cc does not cleanly handle a failed
+         * internal dlopen: instead of returning NULL it returns a
+         * partially-initialized TfLiteDelegate whose function pointers
+         * are garbage, which then crashes with SIGSEGV/SIGBUS inside
+         * tflite::Subgraph::ModifyGraphWithDelegateImpl. Probing here
+         * produces a clean error message and skips the delegate path
+         * entirely when the library is missing (e.g. libvx_delegate.so
+         * on an i.MX 95 image that only ships libneutron_delegate.so).
+         */
+        {
+          void *probe = dlopen (ext_delegate_path, RTLD_LAZY | RTLD_LOCAL);
+          if (!probe) {
+            ml_loge ("External delegate library '%s' cannot be loaded: %s. "
+                "Verify the library is installed on the target and that "
+                "ExtDelegateLib matches the platform delegate (e.g. "
+                "libneutron_delegate.so on i.MX 95, libvx_delegate.so on "
+                "i.MX 8M Plus).",
+                ext_delegate_path, dlerror ());
+            return -2;
+          }
+          /* Keep the library mapped; TfLiteExternalDelegateCreate will
+           * reuse the existing mapping via its own dlopen. */
+        }
+
         TfLiteExternalDelegateOptions options;
 
         options = TfLiteExternalDelegateOptionsDefault (ext_delegate_path);
@@ -1035,6 +1061,15 @@ TFLiteInterpreter::loadModel (int num_threads, tflite_delegate_e delegate_e)
         }
 
         delegate = TfLiteExternalDelegateCreate (&options);
+        if (!delegate) {
+          /* Belt-and-suspenders: if a future TFLite release fixes its
+           * error path and returns NULL, surface that as a clean error
+           * rather than letting the NULL propagate into the interpreter. */
+          ml_loge ("TfLiteExternalDelegateCreate returned NULL for '%s'. "
+              "The library loaded but the delegate could not be constructed.",
+              ext_delegate_path);
+          return -2;
+        }
         void (*deleter) (TfLiteDelegate *) = [] (TfLiteDelegate *delegate_) {
           TfLiteExternalDelegateDelete (delegate_);
         };
