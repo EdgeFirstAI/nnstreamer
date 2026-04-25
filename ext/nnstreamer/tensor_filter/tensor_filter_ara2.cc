@@ -526,20 +526,14 @@ Ara2Core::populateTensorMeta ()
 
     /* NNStreamer uses innermost-first dimension ordering.
      *
-     * Output tensors use [nch:W:H:1], which differs from the input
-     * ordering [W:H:C:1]. This is intentional: output tensors are
-     * typically flat feature vectors (e.g. YOLOv8n detection scores
-     * [80:8400:1:1] and boxes [4:8400:1:1]) where nch is the feature
-     * dimension, not a spatial channel count. The innermost dimension
-     * is the feature count for fastest downstream iteration.
+     * DVM output memory is C-contiguous CHW, same as inputs:
+     *   data[nch][height][width] — W varies fastest (stride 1).
      *
-     * NOTE: This mapping is hard-coded for the current YOLOv8n.dvm
-     * output layout. It should ideally be probed from model metadata
-     * or edgefirst.json to support models with different output
-     * tensor semantics (e.g. spatial feature maps). */
-    info->dimension[0] = p->nch;
-    info->dimension[1] = p->width;
-    info->dimension[2] = p->height;
+     * NNStreamer dimension[0] = innermost = W (fastest varying).
+     * This gives [W:H:C:1], matching the input ordering. */
+    info->dimension[0] = p->width;
+    info->dimension[1] = p->height;
+    info->dimension[2] = p->nch;
     info->dimension[3] = 1;
 
     info->type = bppToTensorType (p->bpp,
